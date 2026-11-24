@@ -1,0 +1,8 @@
+*
+!Dockerfile
+!requirements-web.lock
+!manager.py
+!sc_manager/
+!sc_manager/**
+**/__pycache__/
+**/*.pyc

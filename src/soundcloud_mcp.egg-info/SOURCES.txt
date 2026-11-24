@@ -1,0 +1,16 @@
+LICENSE
+README.md
+pyproject.toml
+src/soundcloud_mcp/__init__.py
+src/soundcloud_mcp/__main__.py
+src/soundcloud_mcp/auth_cli.py
+src/soundcloud_mcp/client.py
+src/soundcloud_mcp/config.py
+src/soundcloud_mcp/oauth.py
+src/soundcloud_mcp/server.py
+src/soundcloud_mcp.egg-info/PKG-INFO
+src/soundcloud_mcp.egg-info/SOURCES.txt
+src/soundcloud_mcp.egg-info/dependency_links.txt
+src/soundcloud_mcp.egg-info/entry_points.txt
+src/soundcloud_mcp.egg-info/requires.txt
+src/soundcloud_mcp.egg-info/top_level.txt
