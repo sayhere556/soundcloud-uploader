@@ -49,7 +49,7 @@ def create_app(store=None, run_worker=True):
         yield
         stop.set()
         if run_worker: await asyncio.to_thread(thread.join,2)
-    app=FastAPI(title='sc / upload desk',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
+    app=FastAPI(title='soundcloud uploader',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
     app.state.store=store
     hosts=['localhost','127.0.0.1','[::1]']
     for url in (os.getenv('SCM_REDIRECT_URI',''),os.getenv('SCM_PUBLIC_URL','')):
@@ -61,7 +61,7 @@ def create_app(store=None, run_worker=True):
         allowed=hosts+[urlparse(store.redirect_uri()).hostname]
         if request.url.hostname not in allowed: return Response('Invalid host',status_code=400)
         if request.method not in ('GET','HEAD','OPTIONS') and request.headers.get('x-scm-request')!='1':
-            return JSONResponse({'detail':'Open the upload desk to perform this action.'},status_code=403)
+            return JSONResponse({'detail':'Open soundcloud uploader to perform this action.'},status_code=403)
         response=await call_next(request)
         response.headers.update({'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer',
           'Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'self'"})
