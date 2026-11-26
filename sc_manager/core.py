@@ -265,27 +265,19 @@ class AccountStore:
 import io
 import math
 import warnings
-from html.parser import HTMLParser
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 from PIL import Image, ImageOps
 
 BASE_DEFAULTS = {'visibility': 'private', 'art': {'source': 'none', 'color': '#000000',
     'asset': '', 'url': '', 'fit': 'crop', 'fill': '#ffffff', 'zoom': 1.0, 'x': 0.5, 'y': 0.5}}
 
-class OpenGraphImage(HTMLParser):
-    def __init__(self):
-        super().__init__(); self.image = ''
-    def handle_starttag(self, tag, attrs):
-        data = dict(attrs)
-        if tag == 'meta' and data.get('property') == 'og:image':
-            self.image = data.get('content', '')
 
 def validate_art(options):
     art = {**BASE_DEFAULTS['art'], **options}
     if set(options) - set(BASE_DEFAULTS['art']):
         raise AppError('Unknown artwork setting.')
-    if art['source'] not in ('none', 'solid', 'file', 'pinterest') or art['fit'] not in ('crop','fill'):
-        raise AppError('Choose no artwork, solid, file or Pinterest artwork, and crop or fill.')
+    if art['source'] not in ('none', 'solid', 'file') or art['fit'] not in ('crop','fill'):
+        raise AppError('Choose no artwork, a solid color or an image, and crop or fill.')
     for field in ('color','fill'):
         if not re.fullmatch(r'#[0-9a-fA-F]{6}', art[field]):
             raise AppError('Colors must be six-digit hex values, such as #111111.')
@@ -296,7 +288,7 @@ def validate_art(options):
     if art['asset'] and not re.fullmatch(r'[a-f0-9]{32}\.png', art['asset']):
         raise AppError('Invalid artwork asset.')
     if len(art['url']) > 2048:
-        raise AppError('Pinterest link is too long.')
+        raise AppError('Artwork reference is too long.')
     return art
 
 class Store(AccountStore):
@@ -320,6 +312,9 @@ class Store(AccountStore):
     def defaults(self):
         path = self.root / 'defaults.json'
         saved = json.loads(path.read_text()) if path.exists() else {}
+        legacy=saved.get('art',{})
+        if legacy.get('source')=='pinterest':
+            legacy['source']='file' if legacy.get('asset') else 'none';legacy['url']=''
         return {'account':saved.get('account',''), 'visibility': saved.get('visibility','private'),
                 'art': validate_art(saved.get('art', BASE_DEFAULTS['art']))}
 
@@ -371,39 +366,6 @@ class Store(AccountStore):
         except Exception:
             raise AppError('This image could not be opened. Use a JPG, PNG or WebP image.') from None
 
-    def pinterest(self, url):
-        def download(target, image=False):
-            for attempt in range(5):
-                parsed = urlparse(target)
-                allowed = {'i.pinimg.com'} if image else {'pinterest.com','www.pinterest.com','pin.it'}
-                if parsed.scheme != 'https' or parsed.hostname not in allowed or parsed.username or parsed.password or parsed.port not in (None,443):
-                    raise AppError('Use a public pinterest.com pin, pin.it link or i.pinimg.com image URL.')
-                with httpx.Client(timeout=25, follow_redirects=False, trust_env=False) as client:
-                    with client.stream('GET', target, headers={'User-Agent':'SCUploadDesk/1.0'}) as response:
-                        if response.is_redirect:
-                            target = urljoin(target, response.headers.get('location',''))
-                            continue
-                        if response.status_code != 200:
-                            raise AppError('Pinterest did not make this image available. Use its direct image link or upload a saved copy.')
-                        limit = MAX_ART if image else 2 * 1024**2
-                        chunks=[]; size=0
-                        for chunk in response.iter_bytes():
-                            size += len(chunk)
-                            if size > limit: raise AppError('Pinterest response is too large.')
-                            chunks.append(chunk)
-                        return b''.join(chunks)
-            raise AppError('Pinterest redirected too many times. Use the direct image link.')
-        try:
-            if urlparse(url).hostname == 'i.pinimg.com':
-                content = download(url, True)
-            else:
-                parser = OpenGraphImage(); parser.feed(download(url).decode('utf-8','replace'))
-                if not parser.image:
-                    raise AppError('No public image found on that pin. Use the i.pinimg.com image link or upload a saved copy.')
-                content = download(parser.image, True)
-            return self.save_art(io.BytesIO(content))
-        except httpx.HTTPError:
-            raise AppError('Pinterest could not be reached. Try a direct image link or upload a saved image.') from None
 
     def render_art(self, options, size=3000):
         art = validate_art(options)
@@ -576,3 +538,35 @@ class Store(AccountStore):
         complete=sum(job['state']=='succeeded' for job in jobs)
         status='needs_review' if problem else ('succeeded' if complete==len(jobs) and (not tape or tape['state']=='succeeded') else 'uploading')
         return {'state':status,'completed':complete,'total':len(jobs),'playlist':bool(tape),'error':problem['error'] if problem else None}
+
+    def import_account(self, account, source):
+        self.account_path(account)
+        raw=source.read(65537)
+        if len(raw)>65536: raise AppError('Choose a token JSON file smaller than 64 KB.')
+        try: data=json.loads(raw)
+        except (ValueError,UnicodeError): raise AppError('This file is not valid JSON.') from None
+        if not isinstance(data,dict): raise AppError('The token JSON must contain an object.')
+        access=data.get('access_token');refresh=data.get('refresh_token','')
+        if not isinstance(access,str) or not access.strip() or len(access)>8192 or not access.isascii() or any(ord(c)<33 or ord(c)==127 for c in access):
+            raise AppError('The JSON needs a valid access_token string.')
+        if not isinstance(refresh,str) or len(refresh)>8192 or any(c.isspace() for c in refresh):
+            raise AppError('The JSON refresh_token must be a string.')
+        try:
+            expires=float(data.get('expires_in',3600));obtained=float(data.get('obtained_at',time.time()))
+            if not math.isfinite(expires) or not math.isfinite(obtained) or not 0<expires<=31536000 or obtained<0: raise ValueError()
+        except (TypeError,ValueError): raise AppError('expires_in and obtained_at must be valid numbers.') from None
+        tokens={'access_token':access,'refresh_token':refresh,'token_type':str(data.get('token_type','Bearer'))[:32],
+            'expires_in':expires,'obtained_at':obtained,'scope':str(data.get('scope',''))[:2048]}
+        with FileLock(str(self.account_path(account))+'.lock'):
+            if self.account_path(account).exists(): raise AppError('This account name already exists. Use a different name to preserve it.')
+            try:
+                response=httpx.get(API+'/me',headers={'Authorization':'OAuth '+tokens['access_token']},timeout=30)
+                if response.status_code==401: raise AppError('This token has expired or is invalid. Import a fresh JSON file or link with SoundCloud.')
+                if not response.is_success: raise AppError('SoundCloud could not validate this token. Import a current token JSON file.')
+                profile=response.json()
+                if not isinstance(profile,dict) or not profile.get('id'): raise AppError('SoundCloud could not identify this account.')
+            except httpx.HTTPError: raise AppError('SoundCloud could not be reached. No account was saved.') from None
+            except ValueError: raise AppError('SoundCloud returned an unreadable account response. No account was saved.') from None
+            tokens.update(username=profile.get('username',account),user_id=profile['id'],label=account)
+            self.save_account(account,tokens)
+        return {'name':account,'username':tokens['username'],'connected':True}

@@ -1,5 +1,5 @@
-# SoundCloud upload desk
+# SoundCloud uploader
 
-Standalone sc.py CLI with a minimal web interface. Upload singles or ordered tapes, save visibility and artwork defaults, and crop or color-fill covers.
+Standalone sc.py CLI with a minimal dark web interface. Upload singles or ordered tapes, import account token JSON or link with SoundCloud, and save visibility and artwork defaults. Covers support no artwork, solid colors, image cropping and color fill at 3000 x 3000.
 
-See [setup and usage](SC_MANAGER.md). For a demo, install requirements-web.lock and run python sc.py --demo web.
+See [setup and usage](SC_MANAGER.md).

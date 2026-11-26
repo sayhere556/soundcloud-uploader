@@ -27,7 +27,7 @@ def stage(store,name='mix.wav'):
 
 def test_upload_desk_has_no_track_management(client):
     page=client.get('/').text
-    assert 'Upload desk' in page and 'Tape' in page
+    assert 'Upload' in page and 'Tape' in page
     assert all(text not in page for text in ('Your tracks','Edit track','Upload activity','Load sample files','DEMO'))
     assert '3000 × 3000' in page and 'No artwork' in page
     assert all(color in page for color in ('#000000','#ffffff','#6e5191'))
@@ -101,18 +101,6 @@ def test_invalid_art_and_path_are_rejected(store):
     with pytest.raises(AppError): store.save_art(io.BytesIO(b'not-image'))
     with pytest.raises(AppError): store.account_path('../escape')
 
-def test_pinterest_redirect_and_domain_limits(store,monkeypatch):
-    with pytest.raises(AppError): store.pinterest('http://127.0.0.1/private')
-    with pytest.raises(AppError): store.pinterest('https://i.pinimg.com.evil.example/image.jpg')
-    with pytest.raises(AppError): store.pinterest('https://user:password@i.pinimg.com/image.jpg')
-    image=io.BytesIO();Image.new('RGB',(30,30),'blue').save(image,format='PNG')
-    def handler(request):
-        if request.url.host=='www.pinterest.com': return httpx.Response(200,text='<meta property="og:image" content="https://i.pinimg.com/test.png">')
-        return httpx.Response(200,content=image.getvalue())
-    original=httpx.Client
-    monkeypatch.setattr(httpx,'Client',lambda **kw:original(transport=httpx.MockTransport(handler),**kw))
-    asset=store.pinterest('https://www.pinterest.com/pin/123/')
-    assert store.art_path(asset).exists()
 
 def test_stage_submit_and_cancel_api(client,store):
     staged=client.post('/api/stage',headers=HEADERS,files={'audio':('mix.wav',b'RIFF-mock')}).json()
@@ -170,7 +158,7 @@ def test_standalone_embeds_web_assets(tmp_path):
     isolated=tmp_path/'sc.py';shutil.copy(root/'sc.py',isolated)
     spec=importlib.util.spec_from_file_location('portable_sc',isolated);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
     with TestClient(module.create_app(module.Store(tmp_path/'data',demo=True),run_worker=False),base_url='http://localhost') as client:
-        assert 'Upload desk' in client.get('/').text
+        assert 'Upload' in client.get('/').text
         assert 'drawArt' in client.get('/static/app.js').text
         assert client.get('/static/style.css').status_code==200
 
@@ -255,3 +243,46 @@ def test_disconnect_blocks_pending_tape(store):
     store.submit('main',[{'asset':stage(store),'title':'One'}],'Pending')
     with pytest.raises(AppError): store.disconnect('main')
     assert store.account_path('main').exists()
+
+
+def test_token_json_import_accepts_shape_and_hides_secrets(client,store,monkeypatch):
+    payload={'access_token':'fixture-access','token_type':'Bearer','expires_in':3599,'refresh_token':'fixture-refresh','scope':'','obtained_at':time.time()}
+    requests=[]
+    def profile(url,**kwargs):
+        requests.append(kwargs['headers']['Authorization'])
+        return httpx.Response(200,json={'id':55,'username':'Imported account'})
+    monkeypatch.setattr(httpx,'get',profile)
+    result=client.post('/api/accounts/imported/import',headers=HEADERS,files={'token_file':('tokens.json',json.dumps(payload),'application/json')})
+    assert result.status_code==200 and result.json()['username']=='Imported account'
+    assert requests==['OAuth fixture-access']
+    saved=store.account('imported')
+    assert saved['access_token']==payload['access_token'] and saved['refresh_token']==payload['refresh_token']
+    assert saved['obtained_at']==payload['obtained_at'] and saved['token_type']=='Bearer'
+    assert stat.S_IMODE(store.account_path('imported').stat().st_mode)==0o600
+    assert 'fixture-access' not in result.text+client.get('/api/state').text
+    assert 'fixture-refresh' not in result.text+client.get('/api/state').text
+    again=client.post('/api/accounts/imported/import',headers=HEADERS,files={'token_file':('tokens.json',json.dumps({**payload,'access_token':'changed'}))})
+    assert again.status_code==400 and store.account('imported')['access_token']=='fixture-access'
+
+def test_token_import_rejects_invalid_without_creating_account(client,store,monkeypatch):
+    for raw in ('not json','[]','{}',json.dumps({'access_token':'bad token'}),json.dumps({'access_token':'x','expires_in':'wrong'}),'x'*65537):
+        result=client.post('/api/accounts/invalid/import',headers=HEADERS,files={'token_file':('tokens.json',raw)})
+        assert result.status_code==400 and not store.account_path('invalid').exists()
+    monkeypatch.setattr(httpx,'get',lambda *a,**kw:httpx.Response(403,text='fixture-private-error'))
+    result=client.post('/api/accounts/invalid/import',headers=HEADERS,files={'token_file':('tokens.json',json.dumps({'access_token':'fixture-secret'}))})
+    assert result.status_code==400 and 'fixture-secret' not in result.text and 'fixture-private-error' not in result.text
+    assert not store.account_path('invalid').exists()
+
+def test_import_cli_only_prints_account_identity(tmp_path,monkeypatch,capsys):
+    path=tmp_path/'tokens.json';path.write_text(json.dumps({'access_token':'fixture-cli-secret','refresh_token':'fixture-cli-refresh','expires_in':3599,'obtained_at':time.time(),'token_type':'Bearer','scope':''}))
+    monkeypatch.setattr(httpx,'get',lambda *a,**kw:httpx.Response(200,json={'id':22,'username':'CLI import'}))
+    assert main(['--data-dir',str(tmp_path/'state'),'-a','imported','import-account',str(path)])==0
+    out=capsys.readouterr().out
+    assert 'CLI import' in out and 'fixture-cli-secret' not in out and path.exists()
+
+def test_removed_pinterest_and_dark_ui(client):
+    page=client.get('/').text;script=client.get('/static/app.js').text
+    assert 'pinterest' not in page.lower()+script.lower()
+    assert client.post('/api/pinterest',headers=HEADERS,json={'url':'https://example.com'}).status_code==404
+    assert 'Import account JSON' in page and 'token-file' in page
+    assert 'color-scheme:dark' in client.get('/static/style.css').text

@@ -24,8 +24,6 @@ class ConnectionInput(BaseModel):
     client_id: str = Field(min_length=1,max_length=512)
     client_secret: str = Field(min_length=1,max_length=2048)
     redirect_uri: str = Field(min_length=1,max_length=2048)
-class PinInput(BaseModel):
-    url: str = Field(min_length=8,max_length=2048)
 class ItemInput(BaseModel):
     asset: str
     title: str = Field(min_length=1,max_length=200)
@@ -97,6 +95,10 @@ def create_app(store=None, run_worker=True):
     def submission(request_id:str): return store.submission_status(request_id)
     @app.post('/api/defaults')
     def defaults(data:dict): return store.save_defaults(data)
+    @app.post('/api/accounts/{account}/import')
+    def import_account(account:str,token_file:UploadFile=File(...)):
+        try: return store.import_account(account,token_file.file)
+        finally: token_file.file.close()
     @app.post('/api/accounts/connect')
     def connect(data:NameInput):
         if store.demo: raise AppError('Use the sample accounts in demo mode. Start without --demo to connect SoundCloud.')
@@ -120,8 +122,6 @@ def create_app(store=None, run_worker=True):
         finally: image.file.close()
     @app.get('/api/artwork/{asset}')
     def artwork_image(asset:str): return Response(store.art_path(asset).read_bytes(),media_type='image/png')
-    @app.post('/api/pinterest')
-    def pinterest(data:PinInput): return {'asset':store.pinterest(data.url)}
     @app.post('/api/artwork/preview')
     def preview(data:dict):
         rendered=store.render_art(data)

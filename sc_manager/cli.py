@@ -44,7 +44,7 @@ def login_local(store, account, no_browser=False):
     print('Connected '+account+'.')
 
 def art_flags(parser):
-    parser.add_argument('--art','--cover',dest='art',help='none, hex color, local image, or public Pinterest pin/image URL')
+    parser.add_argument('--art','--cover',dest='art',help='none, hex color, or local image')
     parser.add_argument('--fit',choices=['crop','fill'])
     parser.add_argument('--fill',help='Six-digit hex color behind an image')
     parser.add_argument('--zoom',type=float)
@@ -56,8 +56,7 @@ def art_from_args(store,args):
     if args.art:
         if args.art.lower()=='none': art.update(source='none',asset='',url='')
         elif args.art.startswith('#'): art.update(source='solid',color=args.art,asset='',url='')
-        elif args.art.startswith('https://'):
-            art.update(source='pinterest',url=args.art,asset=store.pinterest(args.art))
+        elif args.art.startswith(('http://','https://')): raise AppError('Choose a local image file, a hex color, or none.')
         else:
             with Path(args.art).expanduser().open('rb') as source: asset=store.save_art(source)
             art.update(source='file',asset=asset,url='')
@@ -72,6 +71,7 @@ def main(argv=None):
     parser.add_argument('-a','--account',default=None)
     sub=parser.add_subparsers(dest='command',required=True)
     sub.add_parser('accounts',help='List connected accounts')
+    account_import=sub.add_parser('import-account',help='Import a SoundCloud token JSON file');account_import.add_argument('path')
     login=sub.add_parser('login',help='Standalone OAuth with a temporary callback listener'); login.add_argument('--no-browser',action='store_true')
     defaults=sub.add_parser('defaults',help='Show or save visibility and artwork defaults'); defaults.add_argument('--visibility',choices=['private','public']); art_flags(defaults)
     for command in ('upload','tape'):
@@ -98,6 +98,9 @@ def main(argv=None):
             print(f'Upload desk: http://{args.host}:{args.port}'+(' [DEMO]' if args.demo else ''),flush=True)
             uvicorn.run(create_app(store),host=args.host,port=args.port,access_log=False,log_level='warning')
         elif args.command=='accounts': print(json.dumps(store.accounts(),indent=2))
+        elif args.command=='import-account':
+            with Path(args.path).expanduser().open('rb') as source: result=store.import_account(args.account,source)
+            print('Imported '+result['username']+' as '+result['name']+'.')
         elif args.command=='login':
             if args.demo: raise AppError('Demo accounts are already available.')
             login_local(store,args.account,args.no_browser)

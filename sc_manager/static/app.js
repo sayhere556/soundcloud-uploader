@@ -45,7 +45,7 @@ function geometry(){
 }
 function drawArt(){
  const canvas=$('art-preview'),ctx=canvas.getContext('2d');
- if(art.source==='none'){ctx.fillStyle='#efefeb';ctx.fillRect(0,0,3000,3000);ctx.fillStyle='#aaa';ctx.font='90px Arial';ctx.textAlign='center';ctx.fillText('No artwork',1500,1515);$('preview-tag').textContent='NOT ATTACHED';return;}
+ if(art.source==='none'){ctx.fillStyle='#151518';ctx.fillRect(0,0,3000,3000);ctx.fillStyle='#71717a';ctx.font='120px Arial';ctx.textAlign='center';ctx.fillText('No artwork',1500,1515);$('preview-tag').textContent='NOT ATTACHED';return;}
  ctx.fillStyle=art.source==='solid'?art.color:art.fill;ctx.fillRect(0,0,3000,3000);
  const geom=geometry();if(art.source!=='solid'&&sourceImage&&geom){ctx.imageSmoothingQuality='high';ctx.drawImage(sourceImage,Math.round((3000-geom.width)*art.x),Math.round((3000-geom.height)*art.y),geom.width,geom.height);}
  $('preview-tag').textContent=art.source==='solid'?'SOLID COLOR':(sourceImage?(art.fit==='crop'?'CROPPED IMAGE':'IMAGE + COLOR FILL'):'LOAD AN IMAGE');
@@ -62,10 +62,10 @@ const palette=['#000000','#ffffff','#6e5191'];
 function preset(value){return palette.includes(value.toLowerCase())?value.toLowerCase():'custom';}
 function renderArtControls(){
  $('art-source').value=art.source;
- $('solid-controls').hidden=art.source!=='solid';$('image-controls').hidden=art.source!=='file';$('pinterest-controls').hidden=art.source!=='pinterest';$('crop-controls').hidden=!['file','pinterest'].includes(art.source);$('no-art-note').hidden=art.source!=='none';
+ $('solid-controls').hidden=art.source!=='solid';$('image-controls').hidden=art.source!=='file';$('crop-controls').hidden=!['file'].includes(art.source);$('no-art-note').hidden=art.source!=='none';
  $('color-preset').value=preset(art.color);$('fill-preset').value=preset(art.fill);$('custom-color').hidden=preset(art.color)!=='custom';$('custom-fill').hidden=preset(art.fill)!=='custom';
- $('solid-color').value=art.color;$('solid-hex').value=art.color;$('fill-color').value=art.fill;$('fill-hex').value=art.fill;$('fit').value=art.fit;$('zoom').value=art.zoom;$('crop-x').value=art.x;$('crop-y').value=art.y;$('zoom-value').textContent=Number(art.zoom).toFixed(2)+'×';$('pin-url').value=art.url;
- if(['file','pinterest'].includes(art.source))loadAsset();drawArt();
+ $('solid-color').value=art.color;$('solid-hex').value=art.color;$('fill-color').value=art.fill;$('fill-hex').value=art.fill;$('fit').value=art.fit;$('zoom').value=art.zoom;$('crop-x').value=art.x;$('crop-y').value=art.y;$('zoom-value').textContent=Number(art.zoom).toFixed(2)+'×';
+ if(['file'].includes(art.source))loadAsset();drawArt();
 }
 $('art-source').onchange=event=>{art.source=event.target.value;renderArtControls();};
 for(const [id,field,custom] of [['color-preset','color','custom-color'],['fill-preset','fill','custom-fill']])$(id).onchange=event=>{
@@ -76,7 +76,7 @@ $('fit').onchange=event=>{art.fit=event.target.value;drawArt();};
 for(const [id,field] of [['zoom','zoom'],['crop-x','x'],['crop-y','y']])$(id).oninput=event=>{art[field]=Number(event.target.value);$('zoom-value').textContent=art.zoom.toFixed(2)+'×';drawArt();};
 $('reset-crop').onclick=()=>{art.zoom=1;art.x=.5;art.y=.5;renderArtControls();};
 let drag=null;
-$('art-preview').onpointerdown=event=>{if(!['file','pinterest'].includes(art.source)||!sourceImage)return;const g=geometry();drag={x:event.clientX,y:event.clientY,startX:art.x,startY:art.y,g};event.target.setPointerCapture(event.pointerId);};
+$('art-preview').onpointerdown=event=>{if(!['file'].includes(art.source)||!sourceImage)return;const g=geometry();drag={x:event.clientX,y:event.clientY,startX:art.x,startY:art.y,g};event.target.setPointerCapture(event.pointerId);};
 $('art-preview').onpointermove=event=>{if(!drag)return;const ratio=3000/event.target.getBoundingClientRect().width,dx=3000-drag.g.width,dy=3000-drag.g.height;if(Math.abs(dx)>1)art.x=clamp(drag.startX+(event.clientX-drag.x)*ratio/dx);if(Math.abs(dy)>1)art.y=clamp(drag.startY+(event.clientY-drag.y)*ratio/dy);$('crop-x').value=art.x;$('crop-y').value=art.y;drawArt();};
 $('art-preview').onpointerup=$('art-preview').onpointercancel=()=>{drag=null;};
 $('art-file').onchange=async event=>{
@@ -85,16 +85,11 @@ $('art-file').onchange=async event=>{
  try{const result=await api('/api/artwork',{method:'POST',body});art.asset=result.asset;art.source='file';art.url='';art.zoom=1;art.x=.5;art.y=.5;renderArtControls();}
  catch(error){message(error.message,true);}finally{event.target.value='';}
 };
-$('load-pin').onclick=async()=>{
- const button=$('load-pin');button.disabled=true;button.textContent='Loading…';
- try{const url=$('pin-url').value.trim(),result=await api('/api/pinterest',{method:'POST',body:JSON.stringify({url})});art.asset=result.asset;art.url=url;art.source='pinterest';art.zoom=1;art.x=.5;art.y=.5;renderArtControls();}
- catch(error){message(error.message,true);}finally{button.disabled=false;button.textContent='Load image';}
-};
 function visibilityNote(){$('visibility-note').textContent=$('visibility').value==='private'?'Only you can hear private uploads.':'These tracks will be public on SoundCloud.';}
 $('visibility').onchange=visibilityNote;
 function dialogMessage(id,text,error=false){const target=$(id);target.textContent=text;target.className='dialog-notice'+(error?' error':'');target.hidden=false;}
 function defaultControls(){
- const source=$('default-source').value;$('default-solid').hidden=source!=='solid';$('default-image').hidden=!['file','pinterest'].includes(source);
+ const source=$('default-source').value;$('default-solid').hidden=source!=='solid';$('default-image').hidden=!['file'].includes(source);
  $('default-custom-color').hidden=$('default-color').value!=='custom';$('default-custom-fill').hidden=$('default-fill').value!=='custom';
 }
 for(const id of ['default-source','default-color','default-fill'])$(id).onchange=defaultControls;
@@ -108,7 +103,7 @@ $('defaults-button').onclick=()=>{
 $('defaults-form').onsubmit=async event=>{
  event.preventDefault();const source=$('default-source').value;
  let selected=structuredClone(defaultArtDraft);
- if(['file','pinterest'].includes(source)){
+ if(['file'].includes(source)){
   if(art.source===source&&art.asset)selected=structuredClone(art);
   else if(selected.source!==source||!selected.asset){dialogMessage('defaults-notice','Choose and load this image in the artwork panel first.',true);return;}
  }
@@ -118,6 +113,13 @@ $('defaults-form').onsubmit=async event=>{
  try{state.defaults=await api('/api/defaults',{method:'POST',body:JSON.stringify({account:$('default-account').value,visibility:$('default-visibility').value,art:selected})});
  art=structuredClone(state.defaults.art);$('visibility').value=state.defaults.visibility;if(state.defaults.account)$('account').value=state.defaults.account;renderArtControls();visibilityNote();$('defaults-dialog').close();message('Defaults saved.');}
  catch(error){dialogMessage('defaults-notice',error.message,true);}
+};
+$('import-form').onsubmit=async event=>{
+ event.preventDefault();const file=$('token-file').files[0],button=$('import-button');
+ if(!file)return;if(file.size>65536){dialogMessage('account-notice','Choose a token JSON file smaller than 64 KB.',true);return;}
+ const body=new FormData();body.append('token_file',file);button.disabled=true;button.textContent='Verifying account…';
+ try{const account=await api('/api/accounts/'+encodeURIComponent($('import-name').value.trim())+'/import',{method:'POST',body});$('token-file').value='';$('import-name').value='';await refresh();$('account').value=account.name;dialogMessage('account-notice','Imported '+account.username+'.');}
+ catch(error){dialogMessage('account-notice',error.message,true);}finally{button.disabled=false;button.textContent='Import account';}
 };
 $('accounts-button').onclick=()=>{$('account-notice').hidden=true;$('accounts-dialog').showModal();};
 document.querySelectorAll('[data-close]').forEach(button=>button.onclick=()=>$(button.dataset.close).close());
@@ -156,7 +158,7 @@ async function refresh(){
  $('connect-help').textContent=state.connection.configured?'Authorize on SoundCloud, then return here.':'Add your SoundCloud app credentials in Connection settings first.';
  $('connection-note').textContent=state.connection.configured?'Your SoundCloud app is configured.':'One-time setup for your SoundCloud app.';
  $('connection-form').hidden=state.connection.managed_by_environment;$('callback-display').textContent=state.connection.redirect_uri;
- if(!ready){ready=true;art=structuredClone(state.defaults.art);$('visibility').value=state.defaults.visibility;$('callback-input').value=state.connection.redirect_uri;$('connection-settings').open=!state.connection.configured;renderArtControls();visibilityNote();}
+ if(!ready){ready=true;art=structuredClone(state.defaults.art);$('visibility').value=state.defaults.visibility;$('callback-input').value=state.connection.redirect_uri;$('connection-settings').open=false;renderArtControls();visibilityNote();}
  if(activeSubmission){const progress=await api('/api/submissions/'+encodeURIComponent(activeSubmission));
   $('transfer-text').textContent=progress.completed+'/'+progress.total+' tracks uploaded'+(progress.playlist?' · creating one playlist':'');$('transfer-progress').value=progress.completed/progress.total*100;$('transfer-percent').textContent=Math.round(progress.completed/progress.total*100)+'%';
   if(progress.state==='succeeded'||progress.state==='needs_review'){activeSubmission=null;busy=false;$('transfer').hidden=true;message(progress.state==='succeeded'?(progress.playlist?'Tape uploaded. Playlist created.':'Upload complete.'):(progress.error||'Check SoundCloud before retrying.'),progress.state!=='succeeded');renderFiles();}
@@ -165,7 +167,7 @@ async function refresh(){
 }
 function transfer(item,index,total){return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest(),body=new FormData();body.append('audio',item.file);xhr.open('POST','/api/stage');xhr.setRequestHeader('X-SCM-Request','1');xhr.timeout=30*60*1000;xhr.upload.onprogress=event=>{if(event.lengthComputable){const percent=Math.round(event.loaded/event.total*100);$('transfer-progress').value=percent;$('transfer-percent').textContent=percent+'%';$('transfer-text').textContent='Preparing '+index+'/'+total+': '+item.file.name;}};xhr.onload=()=>{let data;try{data=JSON.parse(xhr.responseText);}catch{return reject(new Error('Transfer response interrupted. Try again.'));}if(xhr.status>=200&&xhr.status<300)resolve(data.asset);else reject(new Error(typeof data.detail==='string'?data.detail:'The file could not be staged.'));};xhr.onerror=xhr.ontimeout=()=>reject(new Error('File transfer interrupted. Try again.'));xhr.send(body);});}
 $('upload-button').onclick=async()=>{
- if(busy)return;if(!$('account').value){$('accounts-dialog').showModal();return;}if(!files.length){message('Add at least one audio file.',true);return;}if(tape&&!$('tape-title').value.trim()){message('Give this tape a title.',true);$('tape-title').focus();return;}if(files.some(item=>!item.title.trim())){message('Every track needs a title.',true);return;}if(['file','pinterest'].includes(art.source)&&!art.asset){message('Load an artwork image first.',true);return;}
+ if(busy)return;if(!$('account').value){$('accounts-dialog').showModal();return;}if(!files.length){message('Add at least one audio file.',true);return;}if(tape&&!$('tape-title').value.trim()){message('Give this tape a title.',true);$('tape-title').focus();return;}if(files.some(item=>!item.title.trim())){message('Every track needs a title.',true);return;}if(['file'].includes(art.source)&&!art.asset){message('Load an artwork image first.',true);return;}
  busy=true;$('upload-button').disabled=true;$('transfer').hidden=false;const batch=[...files],target=$('account').value,title=tape?$('tape-title').value.trim():'',visibility=$('visibility').value,cover=structuredClone(art);submissionId=submissionId||crypto.randomUUID();
  try{for(let i=0;i<batch.length;i++){if(!batch[i].asset)batch[i].asset=await transfer(batch[i],i+1,batch.length);}$('transfer-text').textContent='Adding to the upload queue';await api('/api/submit',{method:'POST',body:JSON.stringify({account:target,items:batch.map(item=>({asset:item.asset,title:item.title})),tape_title:title,visibility,art:cover,request_id:submissionId})});files=files.filter(item=>!batch.includes(item));activeSubmission=submissionId;submissionId=null;message(title?'Uploading tracks in order, then creating your playlist.':'Uploading to SoundCloud.');renderFiles();await refresh();}
  catch(error){message(error.message+' Your selection is kept so you can retry.',true);}
