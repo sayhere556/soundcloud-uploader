@@ -1,75 +1,74 @@
-# SC Manager — CLI + web
+# SoundCloud upload desk
 
-A release workspace for multiple SoundCloud accounts, with a shared CLI, browser interface and persistent upload queue. The supplied sc.py and src/soundcloud_mcp files remain intact. The new entry point is manager.py. It uses its own account storage and never searches your homelab or imports existing tokens.
+Standalone sc.py CLI and minimal web UI for singles and tapes. A tape uploads tracks in your chosen order, then creates one playlist. No track management screen.
 
-## Run in this VS Code Codespace
+## Run
 
-    python3 -m venv .venv-web
+    python -m venv .venv-web
     .venv-web/bin/pip install -r requirements-web.lock
-    .venv-web/bin/python manager.py web
+    .venv-web/bin/python sc.py --demo web
 
-In VS Code, forward port 8085 and keep its visibility **Private**. Open the forwarded port in your browser. The default server binds only to loopback.
+Open http://127.0.0.1:8085. Demo mode uses fake accounts and never uploads to SoundCloud. Omit --demo for real use.
 
-For a no-credentials demo:
+sc.py embeds all Python application code and web assets; copy it anywhere without the project folders. It still requires third-party packages: fastapi, uvicorn, httpx, python-multipart, filelock and pillow. Python 3.12+ is recommended. CLI uploads run without a web server.
 
-    .venv-web/bin/python manager.py --demo web
+## Accounts
 
-Demo mode has three clearly labeled sample accounts and never calls SoundCloud. Click “Try a sample upload” to generate a silent one-second WAV, then add it to the queue. Demo data is separate in .sc-manager-demo; real data uses .sc-manager. Stop the demo before launching the real app on the same port.
+Privately set SOUNDCLOUD_CLIENT_ID and SOUNDCLOUD_CLIENT_SECRET in your environment. Register the exact callback in SoundCloud: http://127.0.0.1:8085/auth/callback by default. SCM_REDIRECT_URI overrides it; SCM_PUBLIC_URL sets the web origin. Outside Docker Compose, .env is not loaded automatically.
 
-## Connect real accounts
+    python sc.py -a main login
+    python sc.py accounts
 
-1. Create/register a SoundCloud API application at https://soundcloud.com/you/apps.
-2. Set SOUNDCLOUD_CLIENT_ID and SOUNDCLOUD_CLIENT_SECRET in Codespace secrets, your process environment, or a private .env in this repository. Do not commit them. .env.web.example lists the new settings, without credentials.
-3. Set SCM_REDIRECT_URI to the exact registered callback, normally https://YOUR-CODESPACE-8085.app.github.dev/auth/callback when using the private forwarded Codespace URL. Set SCM_PUBLIC_URL to that same origin without /auth/callback. Restart the app after changes.
-4. In Accounts, choose a label (main, alt, label, or your own) and connect through SoundCloud. Authorize each account separately.
+Or run python sc.py web and use Accounts. CLI login opens a temporary callback listener. If that port is already used by the web interface, connect there. In a Codespace, keep forwarding private and forward 8085 to the same local port for the default callback.
 
-The CLI login command starts the same OAuth flow. Keep the web server running to receive its callback. Accounts and tokens are private server-side files, written atomically with a per-account lock for single-use refresh tokens. They are never returned to the browser or included in the Docker image.
+Tokens live in .sc-manager, with separate .sc-manager-demo state. Use --data-dir or SCM_DATA_DIR to override. Token files have restricted permissions, not encryption. Existing legacy CLI token files are not imported or overwritten.
 
-## CLI examples
+## Defaults and artwork
 
-    .venv-web/bin/python manager.py --help
-    .venv-web/bin/python manager.py accounts
-    .venv-web/bin/python manager.py -a main login
-    .venv-web/bin/python manager.py -a main list --limit 50
-    .venv-web/bin/python manager.py -a main upload ./mix.wav --cover ./cover.jpg
-    .venv-web/bin/python manager.py -a alt upload ./finished-mixes --private
-    .venv-web/bin/python manager.py -a label upload ./single.wav --public --at 2026-12-01T19:00:00-06:00
-    .venv-web/bin/python manager.py queue
-    .venv-web/bin/python manager.py worker
-    .venv-web/bin/python manager.py cancel JOB_ID
-    .venv-web/bin/python manager.py -a main edit TRACK_URN --title "New title" --sharing public
-    .venv-web/bin/python manager.py -a main disconnect --yes
+    python sc.py defaults --visibility private --art '#111111'
+    python sc.py defaults --art cover.png --fit fill --fill '#ffffff'
+    python sc.py defaults --art 'https://www.pinterest.com/pin/YOUR_PIN_ID/'
+    python sc.py defaults
+    python sc.py art --output preview.jpg
 
-Global flags (--demo, --data-dir and -a) go before the command. Upload commands stage a copy and enqueue work; run worker or keep web running to send it to SoundCloud. Both use the same queue. Private is the default; public uploads and changes take effect on SoundCloud.
+Web and CLI share defaults. Choose Color, Image or Pinterest, adjust the cover, then Save as defaults. Public Pinterest pins, pin.it links and direct i.pinimg.com images are supported. Some pins block loading; use their direct image URL or upload a saved image. There is no Pinterest search or private-board access. Resolved artwork is cached locally for reuse.
+
+Crop fills the square; Fit + fill keeps the image inside a colored square. Zoom and position sliders or dragging adjust the preview. Final artwork is a 1400 × 1400 JPEG with orientation corrected and transparency composited over the fill color. Source files are unchanged.
+
+## Upload
+
+    python sc.py -a main upload song.wav
+    python sc.py -a main upload ./wavs --public --art '#eeeeee'
+    python sc.py -a main tape 'My tape' intro.wav song.wav outro.wav
+    python sc.py -a main upload ./wavs --tape 'My tape'
+
+Explicit files preserve argument order; folders sort by filename, case-insensitively. In the web interface, choose Tape, name it, and use the arrows to reorder tracks. Edit titles before submitting. Visibility and artwork apply to every track and the resulting playlist. The playlist is created only after all tracks succeed.
+
+Uploads run to completion by default. Add --queue to stage for a worker.
+
+    python sc.py queue
+    python sc.py worker
+    python sc.py cancel JOB_ID
+
+The web server runs a worker automatically. Cancelling a waiting tape item stops the remaining tape; it does not delete completed uploads. Interrupted or uncertain requests need review, with no automatic retry that might duplicate a successful remote upload. Check SoundCloud before resubmitting.
 
 ## Docker
 
-    docker compose up -d --build
+    docker compose up --build -d
+    docker compose exec sc-manager python sc.py accounts
+    docker compose exec sc-manager python sc.py queue
 
-Docker publishes only 127.0.0.1:8085. The service runs as a non-root user. A new named volume holds its own accounts, queue and staged files. It does not mount any host account directory. For CLI access to the same Docker queue:
+The container uses only sc.py, runs as a non-root user, stores state in a dedicated /data volume, and binds 8085 to localhost. Compose reads settings from a private .env or the process environment; see .env.example. Keep the app private; multi-user login and public hosting are not configured. Browser uploads can stage local files directly. For container CLI uploads, copy the intended files into the container and use their container paths. Host and Docker state are separate unless explicitly shared.
 
-    docker compose exec sc-manager python manager.py accounts
-    docker compose exec sc-manager python manager.py queue
+## Development
 
-For CLI file uploads in a container, copy only the desired audio/cover files into it with docker compose cp, then use their container paths. Host CLI and Docker use separate data locations unless you deliberately configure shared storage. Never mount an existing token directory without reviewing compatibility.
+Edit sc_manager sources, then regenerate the standalone file:
 
-## Behavior and limits
-
-- WAV/WAVE, FLAC, MP3, AIFF/AIF, M4A and OGG; up to 4 GB per audio file. SoundCloud validates format, duration and account quota.
-- Covers: JPG/JPEG/PNG, up to 20 MB. In a web batch, selected metadata and cover apply to all tracks; filenames supply individual titles. Use separate batches for individual covers.
-- The browser shows transfer progress to this app. Once queued, it shows waiting/scheduled/uploading/completed status. It does not invent SoundCloud encoding progress.
-- Scheduling delays the **upload**, not the publication of an already uploaded track. The app/worker must be running; a due job starts after a stopped workspace resumes.
-- Queue history is capped at the newest 200 records in the interface. Track browsing shows the latest 50 by default (CLI supports up to 200 per request).
-- Interrupted or uncertain uploads become “needs review.” Check SoundCloud before uploading again; the app never automatically retries a potentially successful upload.
-- Successful jobs remove their staged copies. Cancelled/review jobs retain copies for inspection in the data directory. Your source files remain untouched.
-- Local token files are protected by filesystem permissions, not encryption. Keep the data directory private. Use only loopback or authenticated private Codespace forwarding. No public hosting or multi-user authentication is configured.
-- Disconnect revokes this application’s authorization. It does not delete your tracks. Finish/cancel queued work first.
-
-## Validation
-
-    .venv-web/bin/pip install pytest
+    python tools/build_standalone.py
     .venv-web/bin/python -m pytest tests_web -q
     node --check sc_manager/static/app.js
     docker compose config --quiet
 
-Tests use temporary directories and mocked SoundCloud responses. No live upload is performed. API implementation reference: https://developers.soundcloud.com/docs/api/guide and https://developers.soundcloud.com/docs/api/explorer/api.json.
+Tests use temporary directories and mocked services, including copying sc.py alone into a fresh directory. Live uploads still require your own SoundCloud app and account.
+
+Audio: WAV/WAVE, FLAC, MP3, AIFF/AIF, M4A and OGG, up to 4 GB per file. Artwork: 20 MB and 40 megapixels maximum. SoundCloud enforces its own format, duration and quota limits. Recent activity shows up to 200 jobs and 100 tapes. Successful uploads remove staged audio copies; originals remain unchanged.

@@ -27,7 +27,7 @@ AUTH = 'https://secure.soundcloud.com'
 class AppError(Exception):
     pass
 
-class Store:
+class AccountStore:
     def __init__(self, root=None, demo=False):
         load_dotenv(override=False)
         self.demo = demo
@@ -90,17 +90,54 @@ class Store:
             temp.unlink(missing_ok=True)
 
     def accounts(self):
-        result = []
-        for path in sorted((self.root / 'accounts').glob('*.json')):
-            data = self.account(path.stem)
-            result.append({'name': path.stem, 'username': data.get('username', path.stem), 'connected': True})
+        result=[]
+        for path in sorted((self.root/'accounts').glob('*.json')):
+            data=self.account(path.stem)
+            result.append({'name':path.stem,'label':data.get('label',path.stem),
+                'username':data.get('username',path.stem),'connected':True})
         return result
+    def label_account(self, account, label):
+        label=label.strip()
+        if not 1<=len(label)<=60: raise AppError('Use a label of 1–60 characters.')
+        with FileLock(str(self.account_path(account))+'.lock'):
+            data=self.account(account);data['label']=label;self.save_account(account,data)
+        return {'ok':True}
 
+    def settings(self):
+        path=self.root/'app-settings.json'
+        return json.loads(path.read_text()) if path.exists() else {}
     def credentials(self):
-        cid, secret = os.getenv('SOUNDCLOUD_CLIENT_ID'), os.getenv('SOUNDCLOUD_CLIENT_SECRET')
-        if not cid or not secret:
-            raise AppError('Set SOUNDCLOUD_CLIENT_ID and SOUNDCLOUD_CLIENT_SECRET, then restart the app.')
-        return {'client_id': cid, 'client_secret': secret}
+        saved=self.settings()
+        cid=os.getenv('SOUNDCLOUD_CLIENT_ID') or saved.get('client_id')
+        secret=os.getenv('SOUNDCLOUD_CLIENT_SECRET') or saved.get('client_secret')
+        if not cid or not secret: raise AppError('Add your SoundCloud app credentials in Accounts → Connection settings.')
+        return {'client_id':cid,'client_secret':secret}
+    def redirect_uri(self):
+        return os.getenv('SCM_REDIRECT_URI') or self.settings().get('redirect_uri') or 'http://127.0.0.1:8085/auth/callback'
+    def connection_info(self):
+        try: self.credentials(); configured=True
+        except AppError: configured=False
+        return {'configured':configured,'redirect_uri':self.redirect_uri(),
+                'managed_by_environment':bool(os.getenv('SOUNDCLOUD_CLIENT_ID') or os.getenv('SOUNDCLOUD_CLIENT_SECRET'))}
+    def save_connection_settings(self, client_id, client_secret, redirect_uri):
+        if self.connection_info()['managed_by_environment']:
+            raise AppError('Credentials are already supplied by the environment. Update them there.')
+        client_id=client_id.strip(); client_secret=client_secret.strip(); redirect_uri=redirect_uri.strip()
+        parsed=urlparse(redirect_uri)
+        if not client_id or not client_secret or len(client_id)>512 or len(client_secret)>2048:
+            raise AppError('Enter both SoundCloud app credentials.')
+        if (parsed.scheme not in ('https','http') or not parsed.hostname or parsed.username or parsed.password
+            or parsed.query or parsed.fragment or parsed.path!='/auth/callback'
+            or (parsed.scheme=='http' and parsed.hostname not in ('localhost','127.0.0.1','::1'))):
+            raise AppError('Use an HTTPS callback ending in /auth/callback, or HTTP on localhost.')
+        with FileLock(str(self.root/'app-settings.lock')):
+            dest=self.root/'app-settings.json';tmp=dest.with_name('app-settings.'+secrets.token_hex(8)+'.tmp')
+            try:
+                fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+                with os.fdopen(fd,'w') as out: json.dump({'client_id':client_id,'client_secret':client_secret,'redirect_uri':redirect_uri},out)
+                os.replace(tmp,dest)
+            finally: tmp.unlink(missing_ok=True)
+        return self.connection_info()
 
     def oauth_start(self, account):
         self.account_path(account)
@@ -108,7 +145,7 @@ class Store:
         verifier = secrets.token_urlsafe(48)
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b'=').decode()
         state = secrets.token_urlsafe(32)
-        redirect = os.getenv('SCM_REDIRECT_URI', 'http://127.0.0.1:8085/auth/callback')
+        redirect = self.redirect_uri()
         with self.db() as db:
             db.execute('DELETE FROM oauth WHERE created < ?', (time.time() - 600,))
             db.execute('INSERT INTO oauth VALUES (?,?,?,?,?)', (state, account, verifier, redirect, time.time()))
@@ -118,19 +155,23 @@ class Store:
     def oauth_finish(self, state, code):
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = db.execute('SELECT * FROM oauth WHERE state=?', (state,)).fetchone()
-            db.execute('DELETE FROM oauth WHERE state=?', (state,))
-        if not row or row['created'] < time.time() - 600:
+            row=db.execute('SELECT * FROM oauth WHERE state=?',(state,)).fetchone()
+            db.execute('DELETE FROM oauth WHERE state=?',(state,))
+        if not row or row['created']<time.time()-600 or not code:
             raise AppError('Login expired or invalid. Start again from Accounts.')
-        with FileLock(str(self.account_path(row['account'])) + '.lock'):
-            tokens = self.token_exchange({'grant_type': 'authorization_code', 'code': code,
-                'code_verifier': row['verifier'], 'redirect_uri': row['redirect']})
-            self.save_account(row['account'], tokens)
-        profile = self.request(row['account'], 'GET', '/me')
-        with FileLock(str(self.account_path(row['account'])) + '.lock'):
-            tokens = self.account(row['account'])
-            tokens['username'] = profile.get('username', row['account'])
-            self.save_account(row['account'], tokens)
+        tokens=self.token_exchange({'grant_type':'authorization_code','code':code,
+            'code_verifier':row['verifier'],'redirect_uri':row['redirect']})
+        try:
+            response=httpx.get(API+'/me',headers={'Authorization':'OAuth '+tokens['access_token']},timeout=30)
+            if not response.is_success: raise AppError('Could not verify the connected account. Try linking again.')
+            profile=response.json()
+        except httpx.HTTPError: raise AppError('Could not verify the connected account. Try linking again.') from None
+        with FileLock(str(self.account_path(row['account']))+'.lock'):
+            previous=self.account(row['account']) if self.account_path(row['account']).exists() else {}
+            if previous.get('user_id') and str(previous['user_id'])!=str(profile.get('id')):
+                raise AppError('This is a different SoundCloud account. Add it with a new account name.')
+            tokens.update(username=profile.get('username',row['account']),user_id=profile.get('id'),label=previous.get('label',row['account']))
+            self.save_account(row['account'],tokens)
         return row['account']
 
     def token_exchange(self, fields):
@@ -172,41 +213,21 @@ class Store:
     def public_track(track):
         return {key: track.get(key) for key in ('id', 'urn', 'title', 'description', 'genre', 'sharing', 'permalink_url', 'duration', 'playback_count', 'created_at')}
 
-    def tracks(self, account, limit=50):
-        self.account(account)
-        if self.demo:
-            with self.db() as db:
-                rows = db.execute('SELECT payload FROM demo_tracks WHERE account=? ORDER BY rowid DESC', (account,)).fetchall()
-            return [json.loads(row[0]) for row in rows]
-        result = self.request(account, 'GET', '/me/tracks', params={'limit': max(1, min(200, limit)), 'linked_partitioning': 'true'})
-        return [self.public_track(item) for item in (result if isinstance(result, list) else result.get('collection', []))]
 
-    def edit_track(self, account, track_id, fields):
-        if not fields or set(fields) - {'title', 'description', 'genre', 'sharing'}:
-            raise AppError('No supported track changes provided.')
-        if 'sharing' in fields and fields['sharing'] not in ('private', 'public'):
-            raise AppError('Visibility must be private or public.')
-        if 'title' in fields and not fields['title'].strip():
-            raise AppError('Title cannot be blank.')
-        if self.demo:
-            with self.db() as db:
-                row = db.execute('SELECT payload FROM demo_tracks WHERE id=? AND account=?', (str(track_id), account)).fetchone()
-                if not row:
-                    raise AppError('Track not found.')
-                track = json.loads(row[0]); track.update(fields)
-                db.execute('UPDATE demo_tracks SET payload=? WHERE id=?', (json.dumps(track), str(track_id)))
-            return track
-        return self.public_track(self.request(account, 'PUT', '/tracks/' + quote(str(track_id), safe=''), json={'track': fields}))
 
     def disconnect(self, account):
-        with FileLock(str(self.account_path(account)) + '.lock'):
-            with self.db() as db:
-                active = db.execute("SELECT 1 FROM jobs WHERE account=? AND state IN ('queued','uploading')", (account,)).fetchone()
-            if active:
-                raise AppError('Finish or cancel this account’s queued uploads before disconnecting.')
-        if not self.demo:
-            self.request(account, 'POST', '/disconnect')
-        self.account_path(account).unlink(missing_ok=True)
+        # Serialize with uploads so disconnect cannot race a playlist request.
+        try:
+            with FileLock(str(self.root/'worker.lock'),timeout=0):
+                with self.db() as db:
+                    active=db.execute("SELECT 1 FROM jobs WHERE account=? AND state IN ('queued','uploading')",(account,)).fetchone()
+                    tape=db.execute("SELECT 1 FROM tapes WHERE account=? AND state IN ('queued','creating')",(account,)).fetchone()
+                if active or tape: raise AppError('Finish or cancel this account’s waiting uploads before disconnecting.')
+                if not self.demo: self.request(account,'POST','/disconnect')
+                with FileLock(str(self.account_path(account))+'.lock'):
+                    self.account_path(account).unlink(missing_ok=True)
+                if self.defaults().get('account')==account: self.save_defaults({'account':''})
+        except Timeout: raise AppError('An upload is in progress. Try disconnecting after it finishes.') from None
 
     def stage(self, source, filename, artwork=False):
         suffix = Path(filename).suffix.lower()
@@ -229,29 +250,8 @@ class Store:
             dest.unlink(missing_ok=True)
             raise
 
-    def enqueue(self, account, audio, title, artwork=None, scheduled=None, **metadata):
-        self.account(account)
-        if not title.strip() or len(title) > 200:
-            raise AppError('Title must contain 1–200 characters.')
-        if metadata.get('sharing', 'private') not in ('private', 'public'):
-            raise AppError('Visibility must be private or public.')
-        metadata.setdefault('sharing', 'private')
-        job_id = secrets.token_hex(8)
-        with self.db() as db:
-            db.execute('INSERT INTO jobs(id,account,title,audio,artwork,metadata,created,scheduled) VALUES(?,?,?,?,?,?,?,?)',
-                (job_id, account, title.strip(), audio, artwork, json.dumps(metadata), time.time(), scheduled or time.time()))
-        return job_id
 
-    def jobs(self):
-        with self.db() as db:
-            rows = db.execute('SELECT id,account,title,state,created,scheduled,progress,error,result FROM jobs ORDER BY created DESC LIMIT 200').fetchall()
-        return [dict(row) for row in rows]
 
-    def cancel(self, job_id):
-        with self.db() as db:
-            cursor = db.execute("UPDATE jobs SET state='cancelled' WHERE id=? AND state='queued'", (job_id,))
-        if not cursor.rowcount:
-            raise AppError('Only waiting uploads can be cancelled.')
 
     def work_once(self):
         try:
@@ -260,41 +260,319 @@ class Store:
         except Timeout:
             return False
 
+
+# Upload desk: persistent defaults, image preparation and ordered tapes.
+import io
+import math
+import warnings
+from html.parser import HTMLParser
+from urllib.parse import urlparse, urljoin
+from PIL import Image, ImageOps
+
+BASE_DEFAULTS = {'visibility': 'private', 'art': {'source': 'none', 'color': '#000000',
+    'asset': '', 'url': '', 'fit': 'crop', 'fill': '#ffffff', 'zoom': 1.0, 'x': 0.5, 'y': 0.5}}
+
+class OpenGraphImage(HTMLParser):
+    def __init__(self):
+        super().__init__(); self.image = ''
+    def handle_starttag(self, tag, attrs):
+        data = dict(attrs)
+        if tag == 'meta' and data.get('property') == 'og:image':
+            self.image = data.get('content', '')
+
+def validate_art(options):
+    art = {**BASE_DEFAULTS['art'], **options}
+    if set(options) - set(BASE_DEFAULTS['art']):
+        raise AppError('Unknown artwork setting.')
+    if art['source'] not in ('none', 'solid', 'file', 'pinterest') or art['fit'] not in ('crop','fill'):
+        raise AppError('Choose no artwork, solid, file or Pinterest artwork, and crop or fill.')
+    for field in ('color','fill'):
+        if not re.fullmatch(r'#[0-9a-fA-F]{6}', art[field]):
+            raise AppError('Colors must be six-digit hex values, such as #111111.')
+    for field, low, high in (('zoom',1,4),('x',0,1),('y',0,1)):
+        art[field] = float(art[field])
+        if not math.isfinite(art[field]) or not low <= art[field] <= high:
+            raise AppError('Crop position or zoom is out of range.')
+    if art['asset'] and not re.fullmatch(r'[a-f0-9]{32}\.png', art['asset']):
+        raise AppError('Invalid artwork asset.')
+    if len(art['url']) > 2048:
+        raise AppError('Pinterest link is too long.')
+    return art
+
+class Store(AccountStore):
+    def __init__(self, root=None, demo=False):
+        super().__init__(root, demo)
+        (self.root / 'artwork').mkdir(mode=0o700, exist_ok=True)
+        with self.db() as db:
+            columns = {r['name'] for r in db.execute('PRAGMA table_info(jobs)')}
+            for name, type_ in [('tape_id','TEXT'),('position','INTEGER DEFAULT 0')]:
+                if name not in columns:
+                    db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {type_}')
+            db.executescript('''
+              CREATE TABLE IF NOT EXISTS tapes (
+                id TEXT PRIMARY KEY, account TEXT, title TEXT, sharing TEXT, artwork TEXT,
+                state TEXT DEFAULT 'queued', created REAL, error TEXT, result TEXT);
+              CREATE TABLE IF NOT EXISTS staged_audio (
+                id TEXT PRIMARY KEY, path TEXT, created REAL, used INTEGER DEFAULT 0);
+              CREATE TABLE IF NOT EXISTS submissions (id TEXT PRIMARY KEY, result TEXT);
+            ''')
+
+    def defaults(self):
+        path = self.root / 'defaults.json'
+        saved = json.loads(path.read_text()) if path.exists() else {}
+        return {'account':saved.get('account',''), 'visibility': saved.get('visibility','private'),
+                'art': validate_art(saved.get('art', BASE_DEFAULTS['art']))}
+
+    def save_defaults(self, data):
+        if set(data) - {'account','visibility','art'}:
+            raise AppError('Unknown default setting.')
+        with FileLock(str(self.root / 'defaults.lock')):
+            current = self.defaults()
+            current.update(data)
+            if current.get('account'): self.account(current['account'])
+            if current['visibility'] not in ('private','public'):
+                raise AppError('Default visibility must be private or public.')
+            current['art'] = validate_art(current['art'])
+            if current['art']['source'] not in ('none','solid') and not current['art']['asset']:
+                raise AppError('Load an image before saving it as the default.')
+            if current['art']['asset']:
+                self.art_path(current['art']['asset'])
+            dest = self.root / 'defaults.json'
+            tmp = dest.with_suffix('.tmp')
+            tmp.write_text(json.dumps(current, indent=2)); tmp.chmod(0o600)
+            os.replace(tmp, dest)
+        return current
+
+    def art_path(self, asset):
+        if not re.fullmatch(r'[a-f0-9]{32}\.png', asset):
+            raise AppError('Invalid artwork reference.')
+        path = self.root / 'artwork' / asset
+        if not path.is_file():
+            raise AppError('Artwork is missing. Load it again.')
+        return path
+
+    def save_art(self, source):
+        raw = source.read(MAX_ART + 1)
+        if len(raw) > MAX_ART:
+            raise AppError('Artwork must be 20 MB or smaller.')
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('error', Image.DecompressionBombWarning)
+                with Image.open(io.BytesIO(raw)) as image:
+                    if image.width * image.height > 40_000_000:
+                        raise AppError('Artwork is too large. Use an image below 40 megapixels.')
+                    image = ImageOps.exif_transpose(image).convert('RGBA')
+                    image.thumbnail((4000,4000), Image.Resampling.LANCZOS)
+                    asset = secrets.token_hex(16) + '.png'
+                    image.save(self.root / 'artwork' / asset, format='PNG')
+                    return asset
+        except AppError:
+            raise
+        except Exception:
+            raise AppError('This image could not be opened. Use a JPG, PNG or WebP image.') from None
+
+    def pinterest(self, url):
+        def download(target, image=False):
+            for attempt in range(5):
+                parsed = urlparse(target)
+                allowed = {'i.pinimg.com'} if image else {'pinterest.com','www.pinterest.com','pin.it'}
+                if parsed.scheme != 'https' or parsed.hostname not in allowed or parsed.username or parsed.password or parsed.port not in (None,443):
+                    raise AppError('Use a public pinterest.com pin, pin.it link or i.pinimg.com image URL.')
+                with httpx.Client(timeout=25, follow_redirects=False, trust_env=False) as client:
+                    with client.stream('GET', target, headers={'User-Agent':'SCUploadDesk/1.0'}) as response:
+                        if response.is_redirect:
+                            target = urljoin(target, response.headers.get('location',''))
+                            continue
+                        if response.status_code != 200:
+                            raise AppError('Pinterest did not make this image available. Use its direct image link or upload a saved copy.')
+                        limit = MAX_ART if image else 2 * 1024**2
+                        chunks=[]; size=0
+                        for chunk in response.iter_bytes():
+                            size += len(chunk)
+                            if size > limit: raise AppError('Pinterest response is too large.')
+                            chunks.append(chunk)
+                        return b''.join(chunks)
+            raise AppError('Pinterest redirected too many times. Use the direct image link.')
+        try:
+            if urlparse(url).hostname == 'i.pinimg.com':
+                content = download(url, True)
+            else:
+                parser = OpenGraphImage(); parser.feed(download(url).decode('utf-8','replace'))
+                if not parser.image:
+                    raise AppError('No public image found on that pin. Use the i.pinimg.com image link or upload a saved copy.')
+                content = download(parser.image, True)
+            return self.save_art(io.BytesIO(content))
+        except httpx.HTTPError:
+            raise AppError('Pinterest could not be reached. Try a direct image link or upload a saved image.') from None
+
+    def render_art(self, options, size=3000):
+        art = validate_art(options)
+        if art['source']=='none': return None
+        canvas = Image.new('RGB',(size,size), art['color'] if art['source']=='solid' else art['fill'])
+        if art['source'] != 'solid':
+            with Image.open(self.art_path(art['asset'])) as image:
+                image = image.convert('RGBA')
+                scale = (max if art['fit']=='crop' else min)(size/image.width, size/image.height) * art['zoom']
+                width, height = max(1,round(image.width*scale)), max(1,round(image.height*scale))
+                left, top = round((size-width)*art['x']), round((size-height)*art['y'])
+                # Render directly into the output square: panoramic inputs must not
+                # allocate an enormous intermediate image when cropped or zoomed.
+                sx, sy = image.width / width, image.height / height
+                layer = image.transform((size,size), Image.Transform.AFFINE,
+                    (sx,0,-left*sx,0,sy,-top*sy), Image.Resampling.BICUBIC,
+                    fillcolor=(0,0,0,0))
+                canvas.paste(layer, (0,0), layer)
+        out=io.BytesIO(); canvas.save(out,format='JPEG',quality=94,subsampling=0)
+        return out.getvalue()
+
+    def stage_audio(self, stream, filename):
+        path = self.stage(stream, filename)
+        asset = Path(path).name
+        with self.db() as db:
+            db.execute('INSERT INTO staged_audio(id,path,created) VALUES(?,?,?)',(asset,path,time.time()))
+        return asset
+
+    def submit(self, account, items, tape_title='', visibility=None, art=None, request_id=None):
+        self.account(account)
+        if not items or len(items)>100:
+            raise AppError('Choose between 1 and 100 audio files.')
+        defaults = self.defaults(); visibility = visibility or defaults['visibility']
+        if visibility not in ('public','private'): raise AppError('Invalid visibility.')
+        tape_title = tape_title.strip()
+        if len(tape_title)>200: raise AppError('Tape title is too long.')
+        seen=set()
+        for item in items:
+            if set(item) != {'asset','title'} or not isinstance(item['title'],str) or not 1<=len(item['title'].strip())<=200:
+                raise AppError('Every track needs a title of 1–200 characters.')
+            if item['asset'] in seen: raise AppError('The same staged file cannot be submitted twice.')
+            seen.add(item['asset'])
+        request_id = request_id or secrets.token_hex(16)
+        if not re.fullmatch(r'[a-zA-Z0-9_-]{16,80}', request_id): raise AppError('Invalid submission identifier.')
+        with self.db() as db:
+            prior = db.execute('SELECT result FROM submissions WHERE id=?',(request_id,)).fetchone()
+        if prior: return json.loads(prior['result'])
+        cover = self.render_art(art or defaults['art'])
+        tape_id = secrets.token_hex(8) if tape_title else None
+        created=time.time(); output=[]; copies=[]
+        try:
+            with self.db() as db:
+                db.execute('BEGIN IMMEDIATE')
+                prior=db.execute('SELECT result FROM submissions WHERE id=?',(request_id,)).fetchone()
+                if prior: return json.loads(prior['result'])
+                for position,item in enumerate(items):
+                    row=db.execute('SELECT * FROM staged_audio WHERE id=? AND used=0',(item['asset'],)).fetchone()
+                    if not row or not Path(row['path']).is_file(): raise AppError('A file was already submitted or is missing. Add it again.')
+                    job=secrets.token_hex(8)
+                    cover_path=None
+                    if cover is not None:
+                        cover_path=self.root/'uploads'/(job+'.jpg'); cover_path.write_bytes(cover); copies.append(cover_path)
+                    db.execute('INSERT INTO jobs(id,account,title,audio,artwork,metadata,created,scheduled,tape_id,position) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                      (job,account,item['title'].strip(),row['path'],str(cover_path) if cover_path else None,json.dumps({'sharing':visibility}),created+position/1e6,created,tape_id,position))
+                    db.execute('UPDATE staged_audio SET used=1 WHERE id=?',(item['asset'],))
+                    output.append(job)
+                if tape_id:
+                    tape_cover=None
+                    if cover is not None:
+                        tape_cover=self.root/'uploads'/(tape_id+'-tape.jpg'); tape_cover.write_bytes(cover); copies.append(tape_cover)
+                    db.execute('INSERT INTO tapes(id,account,title,sharing,artwork,created) VALUES(?,?,?,?,?,?)',
+                      (tape_id,account,tape_title,visibility,str(tape_cover) if tape_cover else None,created))
+                result={'jobs':output,'tape_id':tape_id}
+                db.execute('INSERT INTO submissions VALUES(?,?)',(request_id,json.dumps(result)))
+            return result
+        except Exception:
+            for path in copies: path.unlink(missing_ok=True)
+            raise
+
+    def jobs(self):
+        with self.db() as db:
+            rows=db.execute('SELECT id,account,title,state,created,progress,error,result,tape_id,position FROM jobs ORDER BY created DESC LIMIT 200').fetchall()
+        return [dict(row) for row in rows]
+
+    def tapes(self):
+        with self.db() as db:
+            rows=db.execute('SELECT id,account,title,sharing,state,created,error,result FROM tapes ORDER BY created DESC LIMIT 100').fetchall()
+        return [dict(row) for row in rows]
+
+    def cancel(self, job_id):
+        with self.db() as db:
+            row=db.execute('SELECT tape_id,state FROM jobs WHERE id=?',(job_id,)).fetchone()
+            if not row or row['state']!='queued': raise AppError('Only waiting uploads can be cancelled.')
+            if row['tape_id']:
+                db.execute("UPDATE tapes SET state='cancelled' WHERE id=?",(row['tape_id'],))
+                db.execute("UPDATE jobs SET state='cancelled' WHERE tape_id=? AND state='queued'",(row['tape_id'],))
+            else:
+                db.execute("UPDATE jobs SET state='cancelled' WHERE id=?",(job_id,))
+
     def _work_locked(self):
         with self.db() as db:
-            # Owning the worker lock proves any older uploading row was interrupted.
-            db.execute("UPDATE jobs SET state='needs_review',error='Worker interrupted. Check SoundCloud before uploading again.' WHERE state='uploading'")
-            db.execute('BEGIN IMMEDIATE') if not db.in_transaction else None
-            row = db.execute("SELECT * FROM jobs WHERE state='queued' AND scheduled<=? ORDER BY created LIMIT 1", (time.time(),)).fetchone()
-            if not row:
-                return False
-            db.execute("UPDATE jobs SET state='uploading',progress=5 WHERE id=?", (row['id'],))
-        try:
-            if self.demo:
-                for value in (20, 45, 75, 95):
-                    time.sleep(0.25)
-                    with self.db() as db:
-                        db.execute('UPDATE jobs SET progress=? WHERE id=?', (value, row['id']))
-                track = {'id': row['id'], 'title': row['title'], **json.loads(row['metadata']), 'playback_count': 0, 'duration': 0}
+            db.execute("UPDATE tapes SET state='needs_review',error='Interrupted. Check SoundCloud before submitting again.' WHERE state='creating' OR id IN (SELECT tape_id FROM jobs WHERE state='uploading')")
+            db.execute("UPDATE jobs SET state='needs_review',error='Interrupted. Check SoundCloud before submitting again.' WHERE state='uploading'")
+            row=db.execute("""SELECT j.* FROM jobs j LEFT JOIN tapes t ON j.tape_id=t.id
+                WHERE j.state='queued' AND j.scheduled<=? AND (j.tape_id IS NULL OR
+                (t.state='queued' AND NOT EXISTS (SELECT 1 FROM jobs prior WHERE prior.tape_id=j.tape_id AND prior.position<j.position AND prior.state!='succeeded')))
+                ORDER BY j.created LIMIT 1""",(time.time(),)).fetchone()
+            if row: db.execute("UPDATE jobs SET state='uploading',progress=5 WHERE id=?",(row['id'],))
+        if row:
+            try:
+                if self.demo:
+                    time.sleep(.2)
+                    track={'id':row['id'],'urn':'soundcloud:tracks:'+row['id'],'title':row['title'],**json.loads(row['metadata'])}
+                else:
+                    with ExitStack() as stack:
+                        audio=stack.enter_context(open(row['audio'],'rb'))
+                        cover=stack.enter_context(open(row['artwork'],'rb')) if row['artwork'] else None
+                        files={'track[asset_data]':(Path(row['audio']).name,audio,'application/octet-stream')}
+                        if cover: files['track[artwork_data]']=('cover.jpg',cover,'image/jpeg')
+                        fields={'track[title]':row['title'],**{f'track[{k}]':str(v) for k,v in json.loads(row['metadata']).items() if v is not None}}
+                        track=self.public_track(self.request(row['account'],'POST','/tracks',data=fields,files=files))
                 with self.db() as db:
-                    db.execute('INSERT INTO demo_tracks VALUES(?,?,?)', (row['id'], row['account'], json.dumps(track)))
-            else:
-                with ExitStack() as stack:
-                    audio = stack.enter_context(open(row['audio'], 'rb'))
-                    files = {'track[asset_data]': (Path(row['audio']).name, audio, 'application/octet-stream')}
-                    if row['artwork']:
-                        cover = stack.enter_context(open(row['artwork'], 'rb'))
-                        files['track[artwork_data]'] = (Path(row['artwork']).name, cover, mimetypes.guess_type(row['artwork'])[0])
-                    fields = {'track[title]': row['title']}
-                    fields.update({f'track[{k}]': str(v) for k,v in json.loads(row['metadata']).items() if v is not None})
-                    track = self.public_track(self.request(row['account'], 'POST', '/tracks', data=fields, files=files))
-            with self.db() as db:
-                db.execute("UPDATE jobs SET state='succeeded',progress=100,result=? WHERE id=?", (json.dumps(track), row['id']))
-            for path in (row['audio'], row['artwork']):
-                if path:
-                    Path(path).unlink(missing_ok=True)
-        except Exception as exc:
-            message = str(exc) if isinstance(exc, AppError) else 'Upload interrupted. Check SoundCloud before submitting it again.'
-            with self.db() as db:
-                db.execute("UPDATE jobs SET state='needs_review',error=? WHERE id=?", (message, row['id']))
-        return True
+                    db.execute("UPDATE jobs SET state='succeeded',progress=100,result=? WHERE id=?",(json.dumps(track),row['id']))
+                for path in (row['audio'],row['artwork']):
+                    if path: Path(path).unlink(missing_ok=True)
+            except Exception as exc:
+                message=str(exc) if isinstance(exc,AppError) else 'Upload interrupted. Check SoundCloud before submitting again.'
+                with self.db() as db:
+                    db.execute("UPDATE jobs SET state='needs_review',error=? WHERE id=?",(message,row['id']))
+                    if row['tape_id']:
+                        db.execute("UPDATE tapes SET state='needs_review',error=? WHERE id=?",(message,row['tape_id']))
+                return True
+        with self.db() as db:
+            tape=db.execute("""SELECT t.* FROM tapes t WHERE t.state='queued'
+                AND EXISTS(SELECT 1 FROM jobs WHERE tape_id=t.id)
+                AND NOT EXISTS(SELECT 1 FROM jobs WHERE tape_id=t.id AND state!='succeeded') ORDER BY t.created LIMIT 1""").fetchone()
+            if tape:
+                db.execute("UPDATE tapes SET state='creating' WHERE id=?",(tape['id'],))
+                tracks=[json.loads(r['result']) for r in db.execute('SELECT result FROM jobs WHERE tape_id=? ORDER BY position',(tape['id'],))]
+        if tape:
+            try:
+                urns=[track.get('urn') or 'soundcloud:tracks:'+str(track['id']) for track in tracks]
+                if self.demo:
+                    playlist={'id':tape['id'],'title':tape['title'],'sharing':tape['sharing'],'tracks':urns}
+                else:
+                    with ExitStack() as stack:
+                        cover=stack.enter_context(open(tape['artwork'],'rb')) if tape['artwork'] else None
+                        raw=self.request(tape['account'],'POST','/playlists',data={
+                            'playlist[title]':tape['title'],'playlist[sharing]':tape['sharing'],
+                            'playlist[tracks][][urn]':','.join(urns)},files={'playlist[artwork_data]':('cover.jpg',cover,'image/jpeg')} if cover else None)
+                    playlist={key:raw.get(key) for key in ('id','urn','title','sharing','permalink_url')}
+                with self.db() as db:
+                    db.execute("UPDATE tapes SET state='succeeded',result=? WHERE id=?",(json.dumps(playlist),tape['id']))
+                if tape['artwork']: Path(tape['artwork']).unlink(missing_ok=True)
+            except Exception as exc:
+                message=str(exc) if isinstance(exc,AppError) else 'Playlist creation interrupted. Check SoundCloud before retrying.'
+                with self.db() as db:
+                    db.execute("UPDATE tapes SET state='needs_review',error=? WHERE id=?",(message,tape['id']))
+        return bool(row or tape)
+
+    def submission_status(self, request_id):
+        with self.db() as db:
+            saved=db.execute('SELECT result FROM submissions WHERE id=?',(request_id,)).fetchone()
+            if not saved: raise AppError('Upload not found.')
+            result=json.loads(saved['result'])
+            jobs=[db.execute('SELECT state,error FROM jobs WHERE id=?',(job,)).fetchone() for job in result['jobs']]
+            tape=db.execute('SELECT state,error FROM tapes WHERE id=?',(result['tape_id'],)).fetchone() if result['tape_id'] else None
+        problem=next((job for job in jobs if job['state'] in ('needs_review','cancelled')),None)
+        if tape and tape['state'] in ('needs_review','cancelled'): problem=tape
+        complete=sum(job['state']=='succeeded' for job in jobs)
+        status='needs_review' if problem else ('succeeded' if complete==len(jobs) and (not tape or tape['state']=='succeeded') else 'uploading')
+        return {'state':status,'completed':complete,'total':len(jobs),'playlist':bool(tape),'error':problem['error'] if problem else None}

@@ -4,3 +4,4 @@ httpx>=0.28,<1
 python-multipart>=0.0.20,<1
 filelock>=3.18,<4
 python-dotenv>=1,<2
+pillow>=12,<14
