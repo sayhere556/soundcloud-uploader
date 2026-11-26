@@ -94,7 +94,7 @@ def main(argv=None):
         if args.command=='web':
             import uvicorn
             from .web import create_app
-            print(f'Upload desk: http://{args.host}:{args.port}',flush=True)
+            print(f'soundcloud uploader: http://{args.host}:{args.port}',flush=True)
             uvicorn.run(create_app(store),host=args.host,port=args.port,access_log=False,log_level='warning')
         elif args.command=='accounts': print(json.dumps(store.accounts(),indent=2))
         elif args.command=='import-account':

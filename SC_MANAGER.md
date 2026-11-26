@@ -2,6 +2,8 @@
 
 A standalone CLI and minimal dark web interface for singles and tapes. A tape uploads tracks in your chosen order, then creates one playlist. There is no track management or upload history screen.
 
+For first-time installation, see [SETUP.md](SETUP.md).
+
 ## Run
 
     python -m venv .venv-web
@@ -50,4 +52,4 @@ Edit sc_manager sources and regenerate the standalone file:
     .venv-web/bin/python -m pytest tests_web -q
     node --check sc_manager/static/app.js
 
-Tests use temporary directories and mocked services. Real account linking and uploads require valid SoundCloud credentials. The original src/soundcloud_mcp code is preserved.
+Tests use temporary directories and mocked services. Real account linking and uploads require valid SoundCloud credentials.
