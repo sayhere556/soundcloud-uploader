@@ -82,7 +82,7 @@ def create_app(store=None, run_worker=True):
         if name not in types: return Response(status_code=404)
         return Response(asset(name),media_type=types[name])
     @app.get('/health')
-    def health(): return {'ok':True,'demo':store.demo}
+    def health(): return {'ok':True}
     @app.get('/api/state')
     def state():
         return {'accounts':store.accounts(),'defaults':store.defaults(),'connection':store.connection_info()}
@@ -101,7 +101,6 @@ def create_app(store=None, run_worker=True):
         finally: token_file.file.close()
     @app.post('/api/accounts/connect')
     def connect(data:NameInput):
-        if store.demo: raise AppError('Use the sample accounts in demo mode. Start without --demo to connect SoundCloud.')
         return {'url':store.oauth_start(data.name)}
     @app.post('/api/accounts/{account}/disconnect')
     def disconnect(account:str): store.disconnect(account); return {'ok':True}

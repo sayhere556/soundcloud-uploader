@@ -1,3 +1,0 @@
-[console_scripts]
-soundcloud-mcp = soundcloud_mcp.server:main
-soundcloud-mcp-auth = soundcloud_mcp.auth_cli:main

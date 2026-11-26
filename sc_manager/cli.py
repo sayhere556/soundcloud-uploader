@@ -66,8 +66,7 @@ def art_from_args(store,args):
 
 def main(argv=None):
     parser=argparse.ArgumentParser(prog='sc.py',description='Standalone SoundCloud uploader. Singles, tapes and an optional web desk.')
-    parser.add_argument('--demo',action='store_true',help=argparse.SUPPRESS)
-    parser.add_argument('--data-dir',help='Private state location (default .sc-manager; demo .sc-manager-demo)')
+    parser.add_argument('--data-dir',help='Private state location (default .sc-manager)')
     parser.add_argument('-a','--account',default=None)
     sub=parser.add_subparsers(dest='command',required=True)
     sub.add_parser('accounts',help='List connected accounts')
@@ -90,19 +89,18 @@ def main(argv=None):
     disconnect=sub.add_parser('disconnect'); disconnect.add_argument('--yes',action='store_true')
     args=parser.parse_args(argv)
     try:
-        store=Store(args.data_dir,demo=args.demo)
+        store=Store(args.data_dir)
         args.account=args.account or store.defaults().get('account') or 'main'
         if args.command=='web':
             import uvicorn
             from .web import create_app
-            print(f'Upload desk: http://{args.host}:{args.port}'+(' [DEMO]' if args.demo else ''),flush=True)
+            print(f'Upload desk: http://{args.host}:{args.port}',flush=True)
             uvicorn.run(create_app(store),host=args.host,port=args.port,access_log=False,log_level='warning')
         elif args.command=='accounts': print(json.dumps(store.accounts(),indent=2))
         elif args.command=='import-account':
             with Path(args.path).expanduser().open('rb') as source: result=store.import_account(args.account,source)
             print('Imported '+result['username']+' as '+result['name']+'.')
         elif args.command=='login':
-            if args.demo: raise AppError('Demo accounts are already available.')
             login_local(store,args.account,args.no_browser)
         elif args.command=='defaults':
             art=art_from_args(store,args)

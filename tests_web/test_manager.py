@@ -17,7 +17,17 @@ from sc_manager.cli import main
 
 HEADERS={'X-SCM-Request':'1'}
 @pytest.fixture
-def store(tmp_path): return Store(tmp_path/'data',demo=True)
+def store(tmp_path,monkeypatch):
+    store=Store(tmp_path/'data')
+    for name in ('main','alt','label'): store.save_account(name,{'username':'Test '+name})
+    counter=iter(range(1,100))
+    def request(account,method,path,**kwargs):
+        if path=='/disconnect': return {}
+        assert method=='POST' and path in ('/tracks','/playlists')
+        identifier=next(counter)
+        return {'id':identifier,'urn':'soundcloud:tracks:'+str(identifier),'title':'Test upload'}
+    monkeypatch.setattr(store,'request',request)
+    return store
 @pytest.fixture
 def client(store):
     with TestClient(create_app(store,run_worker=False),base_url='http://localhost') as result: yield result
@@ -37,12 +47,12 @@ def test_upload_desk_has_no_track_management(client):
     assert 'access_token' not in client.get('/api/state').text
 
 def test_defaults_persist_between_cli_and_web(store,client,capsys):
-    assert main(['--demo','--data-dir',str(store.root),'defaults','--visibility','public','--art','#123456'])==0
+    assert main(['--data-dir',str(store.root),'defaults','--visibility','public','--art','#123456'])==0
     data=client.get('/api/state').json()['defaults']
     assert data['visibility']=='public' and data['art']['color']=='#123456'
     result=client.post('/api/defaults',headers=HEADERS,json={'visibility':'private','art':data['art']})
     assert result.status_code==200
-    assert Store(store.root,demo=True).defaults()['visibility']=='private'
+    assert Store(store.root).defaults()['visibility']=='private'
 
 def test_solid_crop_fill_and_saved_image(store):
     solid=Image.open(io.BytesIO(store.render_art({'source':'solid','color':'#ff0000'})))
@@ -57,7 +67,7 @@ def test_solid_crop_fill_and_saved_image(store):
     assert fill.getpixel((700,30))[1]>250
     saved=store.save_defaults({'art':{'source':'file','asset':asset,'fit':'fill','fill':'#00ff00'}})
     assert saved['art']['asset']==asset
-    assert Store(store.root,demo=True).defaults()['art']['fit']=='fill'
+    assert Store(store.root).defaults()['art']['fit']=='fill'
 
 def test_tape_order_visibility_cover_and_exactly_one_playlist(tmp_path,monkeypatch):
     store=Store(tmp_path/'real');store.save_account('main',{'username':'Mock'})
@@ -85,7 +95,6 @@ def test_tape_order_visibility_cover_and_exactly_one_playlist(tmp_path,monkeypat
     assert not store.work_once()
 
 def test_failed_tape_does_not_continue_or_make_playlist(store,monkeypatch):
-    store.demo=False
     calls=[]
     def fail(*args,**kwargs): calls.append(args);raise AppError('Check SoundCloud before retrying.')
     monkeypatch.setattr(store,'request',fail)
@@ -144,20 +153,21 @@ def test_standalone_runs_without_source_package(tmp_path):
     result=subprocess.run(command+['--help'],cwd=portable,env=env,capture_output=True,text=True)
     assert result.returncode==0,result.stderr
     assert 'tape' in result.stdout
+    Store(portable/'state').save_account('main',{'username':'Test account'})
     audio=portable/'01.wav';audio.write_bytes(b'RIFF-mock')
-    result=subprocess.run(command+['--demo','upload',str(audio)],cwd=portable,env=env,capture_output=True,text=True)
+    result=subprocess.run(command+['-a','main','upload','--queue',str(audio)],cwd=portable,env=env,capture_output=True,text=True)
     assert result.returncode==0,result.stderr
-    assert 'Upload complete.' in result.stdout
-    result=subprocess.run(command+['--demo','tape','Portable tape',str(audio)],cwd=portable,env=env,capture_output=True,text=True)
+    assert 'Queued 1 track(s).' in result.stdout
+    result=subprocess.run(command+['-a','main','tape','--queue','Portable tape',str(audio)],cwd=portable,env=env,capture_output=True,text=True)
     assert result.returncode==0,result.stderr
-    assert 'Tape playlist created.' in result.stdout
+    assert 'Queued 1 track(s) as tape Portable tape.' in result.stdout
 
 def test_standalone_embeds_web_assets(tmp_path):
     import importlib.util
     root=Path(__file__).resolve().parents[1]
     isolated=tmp_path/'sc.py';shutil.copy(root/'sc.py',isolated)
     spec=importlib.util.spec_from_file_location('portable_sc',isolated);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
-    with TestClient(module.create_app(module.Store(tmp_path/'data',demo=True),run_worker=False),base_url='http://localhost') as client:
+    with TestClient(module.create_app(module.Store(tmp_path/'data'),run_worker=False),base_url='http://localhost') as client:
         assert 'Upload' in client.get('/').text
         assert 'drawArt' in client.get('/static/app.js').text
         assert client.get('/static/style.css').status_code==200
@@ -167,7 +177,7 @@ def test_extreme_panorama_renders_bounded(tmp_path):
     from PIL import Image
     import io
     from sc_manager.core import Store
-    store=Store(root=tmp_path, demo=True)
+    store=Store(root=tmp_path)
     raw=io.BytesIO()
     Image.new('RGB',(4000,1),'red').save(raw,format='PNG')
     raw.seek(0)

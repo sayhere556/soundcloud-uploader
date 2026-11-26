@@ -33,10 +33,9 @@ class AppError(Exception):
     pass
 
 class AccountStore:
-    def __init__(self, root=None, demo=False):
+    def __init__(self, root=None):
         load_dotenv(override=False)
-        self.demo = demo
-        self.root = Path(root or os.getenv('SCM_DATA_DIR', '.sc-manager-demo' if demo else '.sc-manager')).resolve()
+        self.root = Path(root or os.getenv('SCM_DATA_DIR', '.sc-manager')).resolve()
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         for name in ('accounts', 'uploads'):
             (self.root / name).mkdir(mode=0o700, exist_ok=True)
@@ -52,15 +51,8 @@ class AccountStore:
               CREATE TABLE IF NOT EXISTS oauth (
                 state TEXT PRIMARY KEY, account TEXT NOT NULL, verifier TEXT NOT NULL,
                 redirect TEXT NOT NULL, created REAL NOT NULL);
-              CREATE TABLE IF NOT EXISTS demo_tracks (
-                id TEXT PRIMARY KEY, account TEXT NOT NULL, payload TEXT NOT NULL);
             ''')
         self.db_path.chmod(0o600)
-        if demo:
-            for account, username in [('main', 'Midnight Studio'), ('alt', 'After Hours'), ('label', 'Night Shift Records')]:
-                path = self.account_path(account)
-                if not path.exists():
-                    self.save_account(account, {'username': username, 'demo': True})
 
     @contextmanager
     def db(self):
@@ -228,7 +220,7 @@ class AccountStore:
                     active=db.execute("SELECT 1 FROM jobs WHERE account=? AND state IN ('queued','uploading')",(account,)).fetchone()
                     tape=db.execute("SELECT 1 FROM tapes WHERE account=? AND state IN ('queued','creating')",(account,)).fetchone()
                 if active or tape: raise AppError('Finish or cancel this account’s waiting uploads before disconnecting.')
-                if not self.demo: self.request(account,'POST','/disconnect')
+                self.request(account, 'POST', '/disconnect')
                 with FileLock(str(self.account_path(account))+'.lock'):
                     self.account_path(account).unlink(missing_ok=True)
                 if self.defaults().get('account')==account: self.save_defaults({'account':''})
@@ -297,8 +289,8 @@ def validate_art(options):
     return art
 
 class Store(AccountStore):
-    def __init__(self, root=None, demo=False):
-        super().__init__(root, demo)
+    def __init__(self, root=None):
+        super().__init__(root)
         (self.root / 'artwork').mkdir(mode=0o700, exist_ok=True)
         with self.db() as db:
             columns = {r['name'] for r in db.execute('PRAGMA table_info(jobs)')}
@@ -481,17 +473,13 @@ class Store(AccountStore):
             if row: db.execute("UPDATE jobs SET state='uploading',progress=5 WHERE id=?",(row['id'],))
         if row:
             try:
-                if self.demo:
-                    time.sleep(.2)
-                    track={'id':row['id'],'urn':'soundcloud:tracks:'+row['id'],'title':row['title'],**json.loads(row['metadata'])}
-                else:
-                    with ExitStack() as stack:
-                        audio=stack.enter_context(open(row['audio'],'rb'))
-                        cover=stack.enter_context(open(row['artwork'],'rb')) if row['artwork'] else None
-                        files={'track[asset_data]':(Path(row['audio']).name,audio,'application/octet-stream')}
-                        if cover: files['track[artwork_data]']=('cover.jpg',cover,'image/jpeg')
-                        fields={'track[title]':row['title'],**{f'track[{k}]':str(v) for k,v in json.loads(row['metadata']).items() if v is not None}}
-                        track=self.public_track(self.request(row['account'],'POST','/tracks',data=fields,files=files))
+                with ExitStack() as stack:
+                    audio=stack.enter_context(open(row['audio'],'rb'))
+                    cover=stack.enter_context(open(row['artwork'],'rb')) if row['artwork'] else None
+                    files={'track[asset_data]':(Path(row['audio']).name,audio,'application/octet-stream')}
+                    if cover: files['track[artwork_data]']=('cover.jpg',cover,'image/jpeg')
+                    fields={'track[title]':row['title'],**{f'track[{k}]':str(v) for k,v in json.loads(row['metadata']).items() if v is not None}}
+                    track=self.public_track(self.request(row['account'],'POST','/tracks',data=fields,files=files))
                 with self.db() as db:
                     db.execute("UPDATE jobs SET state='succeeded',progress=100,result=? WHERE id=?",(json.dumps(track),row['id']))
                 for path in (row['audio'],row['artwork']):
@@ -513,15 +501,12 @@ class Store(AccountStore):
         if tape:
             try:
                 urns=[track.get('urn') or 'soundcloud:tracks:'+str(track['id']) for track in tracks]
-                if self.demo:
-                    playlist={'id':tape['id'],'title':tape['title'],'sharing':tape['sharing'],'tracks':urns}
-                else:
-                    with ExitStack() as stack:
-                        cover=stack.enter_context(open(tape['artwork'],'rb')) if tape['artwork'] else None
-                        raw=self.request(tape['account'],'POST','/playlists',data={
-                            'playlist[title]':tape['title'],'playlist[sharing]':tape['sharing'],
-                            'playlist[tracks][][urn]':','.join(urns)},files={'playlist[artwork_data]':('cover.jpg',cover,'image/jpeg')} if cover else None)
-                    playlist={key:raw.get(key) for key in ('id','urn','title','sharing','permalink_url')}
+                with ExitStack() as stack:
+                    cover=stack.enter_context(open(tape['artwork'],'rb')) if tape['artwork'] else None
+                    raw=self.request(tape['account'],'POST','/playlists',data={
+                        'playlist[title]':tape['title'],'playlist[sharing]':tape['sharing'],
+                        'playlist[tracks][][urn]':','.join(urns)},files={'playlist[artwork_data]':('cover.jpg',cover,'image/jpeg')} if cover else None)
+                playlist={key:raw.get(key) for key in ('id','urn','title','sharing','permalink_url')}
                 with self.db() as db:
                     db.execute("UPDATE tapes SET state='succeeded',result=? WHERE id=?",(json.dumps(playlist),tape['id']))
                 if tape['artwork']: Path(tape['artwork']).unlink(missing_ok=True)
@@ -659,7 +644,7 @@ def create_app(store=None, run_worker=True):
         if name not in types: return Response(status_code=404)
         return Response(asset(name),media_type=types[name])
     @app.get('/health')
-    def health(): return {'ok':True,'demo':store.demo}
+    def health(): return {'ok':True}
     @app.get('/api/state')
     def state():
         return {'accounts':store.accounts(),'defaults':store.defaults(),'connection':store.connection_info()}
@@ -678,7 +663,6 @@ def create_app(store=None, run_worker=True):
         finally: token_file.file.close()
     @app.post('/api/accounts/connect')
     def connect(data:NameInput):
-        if store.demo: raise AppError('Use the sample accounts in demo mode. Start without --demo to connect SoundCloud.')
         return {'url':store.oauth_start(data.name)}
     @app.post('/api/accounts/{account}/disconnect')
     def disconnect(account:str): store.disconnect(account); return {'ok':True}
@@ -778,8 +762,7 @@ def art_from_args(store,args):
 
 def main(argv=None):
     parser=argparse.ArgumentParser(prog='sc.py',description='Standalone SoundCloud uploader. Singles, tapes and an optional web desk.')
-    parser.add_argument('--demo',action='store_true',help=argparse.SUPPRESS)
-    parser.add_argument('--data-dir',help='Private state location (default .sc-manager; demo .sc-manager-demo)')
+    parser.add_argument('--data-dir',help='Private state location (default .sc-manager)')
     parser.add_argument('-a','--account',default=None)
     sub=parser.add_subparsers(dest='command',required=True)
     sub.add_parser('accounts',help='List connected accounts')
@@ -802,18 +785,17 @@ def main(argv=None):
     disconnect=sub.add_parser('disconnect'); disconnect.add_argument('--yes',action='store_true')
     args=parser.parse_args(argv)
     try:
-        store=Store(args.data_dir,demo=args.demo)
+        store=Store(args.data_dir)
         args.account=args.account or store.defaults().get('account') or 'main'
         if args.command=='web':
             import uvicorn
-            print(f'Upload desk: http://{args.host}:{args.port}'+(' [DEMO]' if args.demo else ''),flush=True)
+            print(f'Upload desk: http://{args.host}:{args.port}',flush=True)
             uvicorn.run(create_app(store),host=args.host,port=args.port,access_log=False,log_level='warning')
         elif args.command=='accounts': print(json.dumps(store.accounts(),indent=2))
         elif args.command=='import-account':
             with Path(args.path).expanduser().open('rb') as source: result=store.import_account(args.account,source)
             print('Imported '+result['username']+' as '+result['name']+'.')
         elif args.command=='login':
-            if args.demo: raise AppError('Demo accounts are already available.')
             login_local(store,args.account,args.no_browser)
         elif args.command=='defaults':
             art=art_from_args(store,args)
