@@ -3,11 +3,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 SCM_DATA_DIR=/data
 WORKDIR /app
 COPY requirements-web.lock ./
 RUN pip install --no-cache-dir -r requirements-web.lock \
-    && useradd --uid 10001 --create-home manager \
-    && mkdir /data && chown manager:manager /data
-COPY --chown=manager:manager manager.py ./
-COPY --chown=manager:manager sc_manager ./sc_manager
-USER manager
+    && useradd --uid 10001 --create-home uploader \
+    && mkdir /data && chown uploader:uploader /data
+COPY --chown=uploader:uploader sc.py ./
+USER uploader
 EXPOSE 8085
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8085/health')"
-CMD ["python", "manager.py", "web", "--host", "0.0.0.0", "--port", "8085"]
+CMD ["python", "sc.py", "web", "--host", "0.0.0.0", "--port", "8085"]

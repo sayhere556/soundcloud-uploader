@@ -1,75 +1,53 @@
-# SC Manager — CLI + web
+# SoundCloud uploader
 
-A release workspace for multiple SoundCloud accounts, with a shared CLI, browser interface and persistent upload queue. The supplied sc.py and src/soundcloud_mcp files remain intact. The new entry point is manager.py. It uses its own account storage and never searches your homelab or imports existing tokens.
+A standalone CLI and minimal dark web interface for singles and tapes. A tape uploads tracks in your chosen order, then creates one playlist. There is no track management or upload history screen.
 
-## Run in this VS Code Codespace
+## Run
 
-    python3 -m venv .venv-web
+    python -m venv .venv-web
     .venv-web/bin/pip install -r requirements-web.lock
-    .venv-web/bin/python manager.py web
+    .venv-web/bin/python sc.py web
 
-In VS Code, forward port 8085 and keep its visibility **Private**. Open the forwarded port in your browser. The default server binds only to loopback.
+Open http://127.0.0.1:8085. Python 3.12+ is recommended. sc.py embeds the application and web assets: it can be copied and run without the project folders. It requires fastapi, uvicorn, httpx, python-multipart, filelock, pillow and python-dotenv.
 
-For a no-credentials demo:
+## Accounts
 
-    .venv-web/bin/python manager.py --demo web
+Open Accounts, choose an account name, select your token JSON file, then Import account. Accepted fields are access_token, token_type, expires_in, refresh_token, scope and obtained_at. The access token is checked with SoundCloud before saving. Existing account names are never overwritten. Expired or invalid access tokens must be replaced with a fresh JSON file or linked through SoundCloud.
 
-Demo mode has three clearly labeled sample accounts and never calls SoundCloud. Click “Try a sample upload” to generate a silent one-second WAV, then add it to the queue. Demo data is separate in .sc-manager-demo; real data uses .sc-manager. Stop the demo before launching the real app on the same port.
+CLI equivalent:
 
-## Connect real accounts
+    python sc.py -a main import-account /path/to/tokens.json
+    python sc.py accounts
 
-1. Create/register a SoundCloud API application at https://soundcloud.com/you/apps.
-2. Set SOUNDCLOUD_CLIENT_ID and SOUNDCLOUD_CLIENT_SECRET in Codespace secrets, your process environment, or a private .env in this repository. Do not commit them. .env.web.example lists the new settings, without credentials.
-3. Set SCM_REDIRECT_URI to the exact registered callback, normally https://YOUR-CODESPACE-8085.app.github.dev/auth/callback when using the private forwarded Codespace URL. Set SCM_PUBLIC_URL to that same origin without /auth/callback. Restart the app after changes.
-4. In Accounts, choose a label (main, alt, label, or your own) and connect through SoundCloud. Authorize each account separately.
+Tokens are stored privately with owner-only permissions and are not returned to the browser. Import leaves the original JSON file unchanged. Automatic refresh requires the SoundCloud app credentials that issued the token.
 
-The CLI login command starts the same OAuth flow. Keep the web server running to receive its callback. Accounts and tokens are private server-side files, written atomically with a per-account lock for single-use refresh tokens. They are never returned to the browser or included in the Docker image.
+For OAuth linking, expand Or link with SoundCloud. Configure your app under SoundCloud connection settings or privately set SOUNDCLOUD_CLIENT_ID and SOUNDCLOUD_CLIENT_SECRET. SCM_REDIRECT_URI must exactly match your registered callback; the local default is http://127.0.0.1:8085/auth/callback. SCM_PUBLIC_URL sets the public origin when using a private forwarded URL. Account controls also allow label changes, reconnection and disconnection.
 
-## CLI examples
+## Uploads and artwork
 
-    .venv-web/bin/python manager.py --help
-    .venv-web/bin/python manager.py accounts
-    .venv-web/bin/python manager.py -a main login
-    .venv-web/bin/python manager.py -a main list --limit 50
-    .venv-web/bin/python manager.py -a main upload ./mix.wav --cover ./cover.jpg
-    .venv-web/bin/python manager.py -a alt upload ./finished-mixes --private
-    .venv-web/bin/python manager.py -a label upload ./single.wav --public --at 2026-12-01T19:00:00-06:00
-    .venv-web/bin/python manager.py queue
-    .venv-web/bin/python manager.py worker
-    .venv-web/bin/python manager.py cancel JOB_ID
-    .venv-web/bin/python manager.py -a main edit TRACK_URN --title "New title" --sharing public
-    .venv-web/bin/python manager.py -a main disconnect --yes
+Select files, edit titles and order, choose Singles or Tape, then upload. Tape creates one playlist after all tracks succeed. Only the current submission status is shown.
 
-Global flags (--demo, --data-dir and -a) go before the command. Upload commands stage a copy and enqueue work; run worker or keep web running to send it to SoundCloud. Both use the same queue. Private is the default; public uploads and changes take effect on SoundCloud.
+Defaults are dropdown menus for account, visibility and artwork. Artwork options: no artwork, solid color, or an uploaded image. Colors: #000000, #ffffff, #6e5191, then Custom. Images support crop or fit with color fill, zoom and position. Generated covers are 3000 x 3000 JPEG. No artwork omits the cover entirely. Pinterest is not supported.
+
+    python sc.py -a main upload song.wav
+    python sc.py -a main tape "My tape" 01.wav 02.wav
+    python sc.py --help
+    python sc.py upload --help
+
+CLI uploads run without the web server. Saved defaults apply unless overridden. Uploads run immediately unless --queue is selected; use worker to process queued work. Interrupted submissions may require review in SoundCloud before resubmitting to avoid duplicates.
 
 ## Docker
 
-    docker compose up -d --build
+    docker compose up --build -d
 
-Docker publishes only 127.0.0.1:8085. The service runs as a non-root user. A new named volume holds its own accounts, queue and staged files. It does not mount any host account directory. For CLI access to the same Docker queue:
+The container runs sc.py as a non-root user, stores state in /data, and binds port 8085 to localhost. Keep credentials in private environment settings; see .env.example. Host and container state are separate unless explicitly shared. Keep this single-user app private.
 
-    docker compose exec sc-manager python manager.py accounts
-    docker compose exec sc-manager python manager.py queue
+## Development
 
-For CLI file uploads in a container, copy only the desired audio/cover files into it with docker compose cp, then use their container paths. Host CLI and Docker use separate data locations unless you deliberately configure shared storage. Never mount an existing token directory without reviewing compatibility.
+Edit sc_manager sources and regenerate the standalone file:
 
-## Behavior and limits
-
-- WAV/WAVE, FLAC, MP3, AIFF/AIF, M4A and OGG; up to 4 GB per audio file. SoundCloud validates format, duration and account quota.
-- Covers: JPG/JPEG/PNG, up to 20 MB. In a web batch, selected metadata and cover apply to all tracks; filenames supply individual titles. Use separate batches for individual covers.
-- The browser shows transfer progress to this app. Once queued, it shows waiting/scheduled/uploading/completed status. It does not invent SoundCloud encoding progress.
-- Scheduling delays the **upload**, not the publication of an already uploaded track. The app/worker must be running; a due job starts after a stopped workspace resumes.
-- Queue history is capped at the newest 200 records in the interface. Track browsing shows the latest 50 by default (CLI supports up to 200 per request).
-- Interrupted or uncertain uploads become “needs review.” Check SoundCloud before uploading again; the app never automatically retries a potentially successful upload.
-- Successful jobs remove their staged copies. Cancelled/review jobs retain copies for inspection in the data directory. Your source files remain untouched.
-- Local token files are protected by filesystem permissions, not encryption. Keep the data directory private. Use only loopback or authenticated private Codespace forwarding. No public hosting or multi-user authentication is configured.
-- Disconnect revokes this application’s authorization. It does not delete your tracks. Finish/cancel queued work first.
-
-## Validation
-
-    .venv-web/bin/pip install pytest
+    python tools/build_standalone.py
     .venv-web/bin/python -m pytest tests_web -q
     node --check sc_manager/static/app.js
-    docker compose config --quiet
 
-Tests use temporary directories and mocked SoundCloud responses. No live upload is performed. API implementation reference: https://developers.soundcloud.com/docs/api/guide and https://developers.soundcloud.com/docs/api/explorer/api.json.
+Tests use temporary directories and mocked services. Real account linking and uploads require valid SoundCloud credentials. The original src/soundcloud_mcp code is preserved.

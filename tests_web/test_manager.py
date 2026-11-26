@@ -1,134 +1,298 @@
 import io
 import json
 import os
-import stat
-import time
 from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import time
 import pytest
+import httpx
+from PIL import Image
 from fastapi.testclient import TestClient
-from sc_manager.core import Store, AppError
+from sc_manager.core import Store, AppError, validate_art
 from sc_manager.web import create_app
 from sc_manager.cli import main
 
+HEADERS={'X-SCM-Request':'1'}
 @pytest.fixture
-def store(tmp_path):
-    return Store(tmp_path / 'demo', demo=True)
-
+def store(tmp_path,monkeypatch):
+    store=Store(tmp_path/'data')
+    for name in ('main','alt','label'): store.save_account(name,{'username':'Test '+name})
+    counter=iter(range(1,100))
+    def request(account,method,path,**kwargs):
+        if path=='/disconnect': return {}
+        assert method=='POST' and path in ('/tracks','/playlists')
+        identifier=next(counter)
+        return {'id':identifier,'urn':'soundcloud:tracks:'+str(identifier),'title':'Test upload'}
+    monkeypatch.setattr(store,'request',request)
+    return store
 @pytest.fixture
 def client(store):
-    with TestClient(create_app(store, run_worker=False), base_url='http://localhost') as client:
-        yield client
+    with TestClient(create_app(store,run_worker=False),base_url='http://localhost') as result: yield result
 
-HEADERS = {'X-SCM-Request': '1'}
+def stage(store,name='mix.wav'):
+    return store.stage_audio(io.BytesIO(b'RIFF-test-wave'),name)
 
-def test_dashboard_and_no_secret_fields(client):
-    assert client.get('/').status_code == 200
-    assert 'SC Manager' in client.get('/').text
-    data = client.get('/api/state').json()
-    assert len(data['accounts']) == 3
-    assert 'access_token' not in json.dumps(data)
-    assert 'client_secret' not in json.dumps(data)
+def test_upload_desk_has_no_track_management(client):
+    page=client.get('/').text
+    assert 'Upload' in page and 'Tape' in page
+    assert all(text not in page for text in ('Your tracks','Edit track','Upload activity','Load sample files','DEMO'))
+    assert '3000 × 3000' in page and 'No artwork' in page
+    assert all(color in page for color in ('#000000','#ffffff','#6e5191'))
+    assert 'jobs' not in client.get('/api/state').json() and 'tapes' not in client.get('/api/state').json()
+    assert client.get('/api/tracks/main').status_code==404
+    assert client.get('/api/state').json()['defaults']['visibility']=='private'
+    assert 'access_token' not in client.get('/api/state').text
 
-def test_origin_barrier_and_host_check(client):
-    assert client.post('/api/jobs/x/cancel').status_code == 403
-    assert client.get('/', headers={'host': 'attacker.example'}).status_code == 400
+def test_defaults_persist_between_cli_and_web(store,client,capsys):
+    assert main(['--data-dir',str(store.root),'defaults','--visibility','public','--art','#123456'])==0
+    data=client.get('/api/state').json()['defaults']
+    assert data['visibility']=='public' and data['art']['color']=='#123456'
+    result=client.post('/api/defaults',headers=HEADERS,json={'visibility':'private','art':data['art']})
+    assert result.status_code==200
+    assert Store(store.root).defaults()['visibility']=='private'
 
-def test_upload_queue_worker_and_edit(client, store):
-    response = client.post('/api/uploads', headers=HEADERS, data={'account':'main','title':'Night drive'}, files={'audio':('mix.wav',b'RIFF-test-wave','audio/wav')})
-    assert response.status_code == 200
-    job_id = response.json()['id']
-    assert store.jobs()[0]['state'] == 'queued'
-    assert Store(store.root, demo=True).jobs()[0]['id'] == job_id
-    assert store.work_once()
-    job = store.jobs()[0]
-    assert job['state'] == 'succeeded'
-    assert list((store.root / 'uploads').iterdir()) == []
-    tracks = client.get('/api/tracks/main').json()['tracks']
-    assert tracks[0]['sharing'] == 'private'
-    updated = client.patch('/api/tracks/main/'+job_id, headers=HEADERS, json={'title':'Revised','sharing':'public'})
-    assert updated.status_code == 200
-    assert updated.json()['title'] == 'Revised'
+def test_solid_crop_fill_and_saved_image(store):
+    solid=Image.open(io.BytesIO(store.render_art({'source':'solid','color':'#ff0000'})))
+    assert solid.size==(3000,3000) and solid.getpixel((100,100))[0]>250
+    source=Image.new('RGB',(200,100),'red'); source.paste('blue',(100,0,200,100))
+    raw=io.BytesIO();source.save(raw,format='PNG');raw.seek(0)
+    asset=store.save_art(raw)
+    left=Image.open(io.BytesIO(store.render_art({'source':'file','asset':asset,'x':0})))
+    right=Image.open(io.BytesIO(store.render_art({'source':'file','asset':asset,'x':1})))
+    assert left.getpixel((1500,1500))[0]>250 and right.getpixel((1500,1500))[2]>250
+    fill=Image.open(io.BytesIO(store.render_art({'source':'file','asset':asset,'fit':'fill','fill':'#00ff00'})))
+    assert fill.getpixel((700,30))[1]>250
+    saved=store.save_defaults({'art':{'source':'file','asset':asset,'fit':'fill','fill':'#00ff00'}})
+    assert saved['art']['asset']==asset
+    assert Store(store.root).defaults()['art']['fit']=='fill'
 
-def test_schedule_and_cancel(client, store):
-    path = store.stage(io.BytesIO(b'wave'), 'a.wav')
-    job = store.enqueue('main', path, 'Future', scheduled=time.time()+86400)
+def test_tape_order_visibility_cover_and_exactly_one_playlist(tmp_path,monkeypatch):
+    store=Store(tmp_path/'real');store.save_account('main',{'username':'Mock'})
+    tracks=[];playlists=[]
+    def request(account,method,path,**kwargs):
+        assert account=='main' and method=='POST'
+        if path=='/tracks':
+            assert kwargs['data']['track[sharing]']=='public'
+            assert kwargs['files']['track[artwork_data]'][1].read(2)==b'\xff\xd8'
+            tracks.append(kwargs['data']['track[title]'])
+            return {'id':len(tracks),'urn':f'soundcloud:tracks:{len(tracks)}','title':tracks[-1]}
+        assert path=='/playlists'
+        playlists.append(kwargs['data'])
+        assert kwargs['data']['playlist[sharing]']=='public'
+        assert kwargs['files']['playlist[artwork_data]'][1].read(2)==b'\xff\xd8'
+        return {'id':9,'title':'Tape'}
+    monkeypatch.setattr(store,'request',request)
+    items=[{'asset':stage(store,'z.wav'),'title':'Second file first'},{'asset':stage(store,'a.wav'),'title':'First file second'}]
+    result=store.submit('main',items,'Tape',visibility='public',art={'source':'solid'},request_id='same-request-123456')
+    assert store.submit('main',items,'Tape',visibility='public',request_id='same-request-123456')==result
+    for _ in range(4): store.work_once()
+    assert tracks==['Second file first','First file second']
+    assert len(playlists)==1 and playlists[0]['playlist[tracks][][urn]']=='soundcloud:tracks:1,soundcloud:tracks:2'
+    assert store.tapes()[0]['state']=='succeeded'
     assert not store.work_once()
-    assert client.post('/api/jobs/'+job+'/cancel',headers=HEADERS).status_code == 200
-    assert store.jobs()[0]['state'] == 'cancelled'
-    assert not store.work_once()
 
-def test_invalid_files_and_account_path(client, store):
-    response = client.post('/api/uploads',headers=HEADERS,data={'account':'main'},files={'audio':('x.exe',b'bad')})
-    assert response.status_code == 400
-    assert list((store.root / 'uploads').iterdir()) == []
-    with pytest.raises(AppError): store.account_path('../escape')
-    with pytest.raises(AppError): store.stage(io.BytesIO(b''),'empty.wav')
-
-def test_interrupted_job_not_retried(store):
-    path = store.stage(io.BytesIO(b'wave'), 'a.wav')
-    job = store.enqueue('main', path, 'Interrupted')
-    with store.db() as db: db.execute("UPDATE jobs SET state='uploading' WHERE id=?",(job,))
-    assert not store.work_once()
-    assert store.jobs()[0]['state'] == 'needs_review'
-
-def test_cli_and_web_share_queue(store, tmp_path, capsys):
-    audio = tmp_path / 'my track.wav'; audio.write_bytes(b'wave')
-    assert main(['--demo','--data-dir',str(store.root),'upload',str(audio)]) == 0
-    assert store.jobs()[0]['title'] == 'my track'
-    assert main(['--demo','--data-dir',str(store.root),'queue']) == 0
-    assert 'my track' in capsys.readouterr().out
-    assert main(['--demo','--data-dir',str(store.root),'upload','/not-a-real-file.wav']) == 1
-
-def test_token_refresh_is_saved_and_not_exposed(tmp_path, monkeypatch):
-    store = Store(tmp_path / 'real')
-    store.save_account('main',{'access_token':'expired-secret','refresh_token':'old-refresh','obtained_at':0,'expires_in':1})
+def test_failed_tape_does_not_continue_or_make_playlist(store,monkeypatch):
     calls=[]
-    def exchange(fields):
-        calls.append(fields)
-        return {'access_token':'new-secret','refresh_token':'new-refresh','obtained_at':time.time(),'expires_in':3600}
+    def fail(*args,**kwargs): calls.append(args);raise AppError('Check SoundCloud before retrying.')
+    monkeypatch.setattr(store,'request',fail)
+    store.submit('main',[{'asset':stage(store),'title':'One'},{'asset':stage(store),'title':'Two'}],'Tape')
+    assert store.work_once()
+    assert not store.work_once()
+    assert len(calls)==1 and store.tapes()[0]['state']=='needs_review'
+
+def test_invalid_art_and_path_are_rejected(store):
+    with pytest.raises(AppError): validate_art({'zoom':float('nan')})
+    with pytest.raises(AppError): validate_art({'fill':'red'})
+    with pytest.raises(AppError): store.art_path('../../secrets')
+    with pytest.raises(AppError): store.save_art(io.BytesIO(b'not-image'))
+    with pytest.raises(AppError): store.account_path('../escape')
+
+
+def test_stage_submit_and_cancel_api(client,store):
+    staged=client.post('/api/stage',headers=HEADERS,files={'audio':('mix.wav',b'RIFF-mock')}).json()
+    result=client.post('/api/submit',headers=HEADERS,json={'account':'main','items':[{'asset':staged['asset'],'title':'Mix'}],'request_id':'test-submit-123456'})
+    assert result.status_code==200
+    job=result.json()['jobs'][0]
+    assert client.post('/api/jobs/'+job+'/cancel',headers=HEADERS).status_code==200
+    assert not store.work_once()
+
+def test_submit_atomic_on_bad_staged_asset(store):
+    asset=stage(store)
+    with pytest.raises(AppError): store.submit('main',[{'asset':asset,'title':'Good'},{'asset':'missing.wav','title':'Missing'}],'Tape')
+    assert store.jobs()==[] and store.tapes()==[]
+    with store.db() as db: assert db.execute('SELECT used FROM staged_audio WHERE id=?',(asset,)).fetchone()[0]==0
+    assert len(list((store.root/'uploads').glob('*.jpg')))==0
+
+def test_interrupted_tape_requires_review(store):
+    result=store.submit('main',[{'asset':stage(store),'title':'One'},{'asset':stage(store),'title':'Two'}],'Tape')
+    with store.db() as db: db.execute("UPDATE jobs SET state='uploading' WHERE id=?",(result['jobs'][0],))
+    assert not store.work_once()
+    assert store.tapes()[0]['state']=='needs_review'
+
+def test_auth_lock_storage_and_oauth_state(tmp_path,monkeypatch):
+    store=Store(tmp_path/'real');calls=[]
+    store.save_account('main',{'access_token':'old','refresh_token':'refresh','expires_in':1,'obtained_at':0})
+    def exchange(fields): calls.append(fields);return {'access_token':'new','refresh_token':'rotated','expires_in':3600,'obtained_at':time.time()}
     monkeypatch.setattr(store,'token_exchange',exchange)
-    assert store.token('main') == 'new-secret'
-    assert store.token('main') == 'new-secret'
-    assert len(calls) == 1
-    assert store.account('main')['refresh_token'] == 'new-refresh'
-    assert stat.S_IMODE(store.account_path('main').stat().st_mode) == 0o600
-    assert 'secret' not in json.dumps(store.accounts())
+    assert store.token('main')=='new' and store.token('main')=='new' and len(calls)==1
+    assert stat.S_IMODE(store.account_path('main').stat().st_mode)==0o600
+    with pytest.raises(AppError): store.oauth_finish('bad','code')
 
-def test_oauth_state_rejected_and_one_time(tmp_path, monkeypatch):
-    store = Store(tmp_path / 'real')
-    monkeypatch.setenv('SOUNDCLOUD_CLIENT_ID','test-client')
-    monkeypatch.setenv('SOUNDCLOUD_CLIENT_SECRET','test-secret')
-    from urllib.parse import urlparse, parse_qs
-    query = parse_qs(urlparse(store.oauth_start('main')).query)
-    assert query['code_challenge_method'] == ['S256']
-    with pytest.raises(AppError): store.oauth_finish('wrong','code')
-    monkeypatch.setattr(store,'token_exchange',lambda fields:{'access_token':'fake','refresh_token':'fake-r','obtained_at':time.time(),'expires_in':3600})
-    monkeypatch.setattr(store,'request',lambda *a,**kw:{'username':'Test Artist'})
-    assert store.oauth_finish(query['state'][0],'code') == 'main'
-    with pytest.raises(AppError): store.oauth_finish(query['state'][0],'code')
+def test_csrf_and_host_limits(client):
+    assert client.post('/api/defaults',json={'visibility':'public'}).status_code==403
+    assert client.get('/',headers={'host':'untrusted.example'}).status_code==400
 
-def test_live_multipart_stream_and_header(tmp_path, monkeypatch):
-    import httpx
-    store = Store(tmp_path / 'real')
-    store.save_account('main', {'access_token':'test-only','obtained_at':time.time(),'expires_in':3600})
-    requests=[]
-    def handler(request):
-        requests.append(request)
-        assert request.headers['authorization'] == 'OAuth test-only'
-        body=request.read()
-        assert b'track[asset_data]' in body and b'track[sharing]' in body and b'private' in body
-        return httpx.Response(201,json={'id':123,'title':'Mix','sharing':'private','secret_token':'must-not-escape'})
-    original=httpx.Client
-    monkeypatch.setattr(httpx,'Client',lambda **kwargs:original(transport=httpx.MockTransport(handler),**kwargs))
-    path=store.stage(io.BytesIO(b'RIFF example'),'mix.wav')
-    store.enqueue('main',path,'Mix')
-    store.work_once()
-    assert store.jobs()[0]['state'] == 'succeeded'
-    assert 'must-not-escape' not in json.dumps(store.jobs())
-    assert len(requests)==1
+def test_standalone_runs_without_source_package(tmp_path):
+    root=Path(__file__).resolve().parents[1]
+    portable=tmp_path/'portable';portable.mkdir();shutil.copy(root/'sc.py',portable/'sc.py')
+    command=[sys.executable,'-I',str(portable/'sc.py')]
+    env={**os.environ,'SCM_DATA_DIR':str(portable/'state')}
+    result=subprocess.run(command+['--help'],cwd=portable,env=env,capture_output=True,text=True)
+    assert result.returncode==0,result.stderr
+    assert 'tape' in result.stdout
+    Store(portable/'state').save_account('main',{'username':'Test account'})
+    audio=portable/'01.wav';audio.write_bytes(b'RIFF-mock')
+    result=subprocess.run(command+['-a','main','upload','--queue',str(audio)],cwd=portable,env=env,capture_output=True,text=True)
+    assert result.returncode==0,result.stderr
+    assert 'Queued 1 track(s).' in result.stdout
+    result=subprocess.run(command+['-a','main','tape','--queue','Portable tape',str(audio)],cwd=portable,env=env,capture_output=True,text=True)
+    assert result.returncode==0,result.stderr
+    assert 'Queued 1 track(s) as tape Portable tape.' in result.stdout
 
-def test_disconnect_preserves_pending_work(store):
-    path=store.stage(io.BytesIO(b'wave'),'mix.wav')
-    store.enqueue('main',path,'Mix')
+def test_standalone_embeds_web_assets(tmp_path):
+    import importlib.util
+    root=Path(__file__).resolve().parents[1]
+    isolated=tmp_path/'sc.py';shutil.copy(root/'sc.py',isolated)
+    spec=importlib.util.spec_from_file_location('portable_sc',isolated);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    with TestClient(module.create_app(module.Store(tmp_path/'data'),run_worker=False),base_url='http://localhost') as client:
+        assert 'Upload' in client.get('/').text
+        assert 'drawArt' in client.get('/static/app.js').text
+        assert client.get('/static/style.css').status_code==200
+
+
+def test_extreme_panorama_renders_bounded(tmp_path):
+    from PIL import Image
+    import io
+    from sc_manager.core import Store
+    store=Store(root=tmp_path)
+    raw=io.BytesIO()
+    Image.new('RGB',(4000,1),'red').save(raw,format='PNG')
+    raw.seek(0)
+    asset=store.save_art(raw)
+    result=store.render_art({'source':'file','asset':asset,'zoom':4})
+    with Image.open(io.BytesIO(result)) as image:
+        assert image.size==(3000,3000)
+        assert image.getpixel((1500,1500))[0]>240
+
+
+def test_no_art_omits_track_and_playlist_multipart(tmp_path,monkeypatch):
+    store=Store(tmp_path/'real');store.save_account('main',{'username':'Mock'})
+    calls=[]
+    def request(account,method,path,**kwargs):
+        calls.append(path)
+        if path=='/tracks':
+            assert 'track[artwork_data]' not in kwargs['files']
+            return {'id':len(calls),'urn':f'soundcloud:tracks:{len(calls)}'}
+        assert path=='/playlists' and not kwargs.get('files')
+        return {'id':99,'title':'No art tape'}
+    monkeypatch.setattr(store,'request',request)
+    store.save_defaults({'art':{'source':'none'},'account':'main'})
+    result=store.submit('main',[{'asset':stage(store),'title':'One'},{'asset':stage(store),'title':'Two'}],'No art tape',request_id='none-art-request-1234')
+    assert store.render_art({'source':'none'}) is None
+    assert not list((store.root/'uploads').glob('*.jpg'))
+    for _ in range(3): store.work_once()
+    assert calls==['/tracks','/tracks','/playlists']
+    assert store.submission_status('none-art-request-1234')=={'state':'succeeded','completed':2,'total':2,'playlist':True,'error':None}
+
+def test_account_label_and_default_preserve_tokens(store,client):
+    store.save_account('main',{'access_token':'mock-secret','refresh_token':'mock-refresh','username':'Mock','user_id':7})
+    assert client.post('/api/accounts/main/label',headers=HEADERS,json={'label':'Personal'}).status_code==200
+    assert store.account('main')['access_token']=='mock-secret'
+    assert client.post('/api/defaults',headers=HEADERS,json={'account':'main','art':{'source':'none'}}).status_code==200
+    public=client.get('/api/state')
+    assert 'mock-secret' not in public.text and 'mock-refresh' not in public.text
+    assert public.json()['accounts'][2]['label']=='Personal'
+    assert client.post('/api/accounts/main/disconnect',headers=HEADERS).status_code==200
+    assert store.defaults()['account']==''
+
+def test_connection_settings_are_private_and_link_uses_pkce(tmp_path,monkeypatch):
+    store=Store(tmp_path/'real')
+    for key in ('SOUNDCLOUD_CLIENT_ID','SOUNDCLOUD_CLIENT_SECRET','SCM_REDIRECT_URI'): monkeypatch.delenv(key,raising=False)
+    with TestClient(create_app(store,run_worker=False),base_url='http://localhost') as client:
+        settings={'client_id':'test-client','client_secret':'test-secret','redirect_uri':'http://127.0.0.1:8085/auth/callback'}
+        assert client.post('/api/connection',headers=HEADERS,json=settings).status_code==200
+        assert stat.S_IMODE((store.root/'app-settings.json').stat().st_mode)==0o600
+        public=client.get('/api/state')
+        assert public.json()['connection']['configured'] is True and 'test-secret' not in public.text
+        link=client.post('/api/accounts/connect',headers=HEADERS,json={'name':'new'}).json()['url']
+        from urllib.parse import parse_qs,urlparse
+        query=parse_qs(urlparse(link).query)
+        assert query['code_challenge_method']==['S256'] and 'client_secret' not in query
+        monkeypatch.setattr(store,'token_exchange',lambda data:{'access_token':'test-access','refresh_token':'test-refresh','expires_in':3600,'obtained_at':time.time()})
+        monkeypatch.setattr(httpx,'get',lambda *a,**kw:httpx.Response(200,json={'id':42,'username':'Linked account'}))
+        assert client.get('/auth/callback',params={'state':query['state'][0],'code':'code'},follow_redirects=False).status_code==303
+        assert store.account('new')['user_id']==42
+        with pytest.raises(AppError): store.oauth_finish(query['state'][0],'code')
+        assert 'test-access' not in client.get('/api/state').text
+
+def test_failed_reconnect_keeps_existing_account(tmp_path,monkeypatch):
+    store=Store(tmp_path/'real')
+    monkeypatch.setattr(store,'credentials',lambda:{'client_id':'test','client_secret':'test'})
+    store.save_account('main',{'access_token':'keep','user_id':1,'username':'Original'})
+    from urllib.parse import urlparse,parse_qs
+    state=parse_qs(urlparse(store.oauth_start('main')).query)['state'][0]
+    monkeypatch.setattr(store,'token_exchange',lambda data:{'access_token':'different'})
+    monkeypatch.setattr(httpx,'get',lambda *a,**kw:httpx.Response(200,json={'id':2,'username':'Other'}))
+    with pytest.raises(AppError): store.oauth_finish(state,'code')
+    assert store.account('main')['access_token']=='keep'
+
+def test_disconnect_blocks_pending_tape(store):
+    store.submit('main',[{'asset':stage(store),'title':'One'}],'Pending')
     with pytest.raises(AppError): store.disconnect('main')
     assert store.account_path('main').exists()
+
+
+def test_token_json_import_accepts_shape_and_hides_secrets(client,store,monkeypatch):
+    payload={'access_token':'fixture-access','token_type':'Bearer','expires_in':3599,'refresh_token':'fixture-refresh','scope':'','obtained_at':time.time()}
+    requests=[]
+    def profile(url,**kwargs):
+        requests.append(kwargs['headers']['Authorization'])
+        return httpx.Response(200,json={'id':55,'username':'Imported account'})
+    monkeypatch.setattr(httpx,'get',profile)
+    result=client.post('/api/accounts/imported/import',headers=HEADERS,files={'token_file':('tokens.json',json.dumps(payload),'application/json')})
+    assert result.status_code==200 and result.json()['username']=='Imported account'
+    assert requests==['OAuth fixture-access']
+    saved=store.account('imported')
+    assert saved['access_token']==payload['access_token'] and saved['refresh_token']==payload['refresh_token']
+    assert saved['obtained_at']==payload['obtained_at'] and saved['token_type']=='Bearer'
+    assert stat.S_IMODE(store.account_path('imported').stat().st_mode)==0o600
+    assert 'fixture-access' not in result.text+client.get('/api/state').text
+    assert 'fixture-refresh' not in result.text+client.get('/api/state').text
+    again=client.post('/api/accounts/imported/import',headers=HEADERS,files={'token_file':('tokens.json',json.dumps({**payload,'access_token':'changed'}))})
+    assert again.status_code==400 and store.account('imported')['access_token']=='fixture-access'
+
+def test_token_import_rejects_invalid_without_creating_account(client,store,monkeypatch):
+    for raw in ('not json','[]','{}',json.dumps({'access_token':'bad token'}),json.dumps({'access_token':'x','expires_in':'wrong'}),'x'*65537):
+        result=client.post('/api/accounts/invalid/import',headers=HEADERS,files={'token_file':('tokens.json',raw)})
+        assert result.status_code==400 and not store.account_path('invalid').exists()
+    monkeypatch.setattr(httpx,'get',lambda *a,**kw:httpx.Response(403,text='fixture-private-error'))
+    result=client.post('/api/accounts/invalid/import',headers=HEADERS,files={'token_file':('tokens.json',json.dumps({'access_token':'fixture-secret'}))})
+    assert result.status_code==400 and 'fixture-secret' not in result.text and 'fixture-private-error' not in result.text
+    assert not store.account_path('invalid').exists()
+
+def test_import_cli_only_prints_account_identity(tmp_path,monkeypatch,capsys):
+    path=tmp_path/'tokens.json';path.write_text(json.dumps({'access_token':'fixture-cli-secret','refresh_token':'fixture-cli-refresh','expires_in':3599,'obtained_at':time.time(),'token_type':'Bearer','scope':''}))
+    monkeypatch.setattr(httpx,'get',lambda *a,**kw:httpx.Response(200,json={'id':22,'username':'CLI import'}))
+    assert main(['--data-dir',str(tmp_path/'state'),'-a','imported','import-account',str(path)])==0
+    out=capsys.readouterr().out
+    assert 'CLI import' in out and 'fixture-cli-secret' not in out and path.exists()
+
+def test_removed_pinterest_and_dark_ui(client):
+    page=client.get('/').text;script=client.get('/static/app.js').text
+    assert 'pinterest' not in page.lower()+script.lower()
+    assert client.post('/api/pinterest',headers=HEADERS,json={'url':'https://example.com'}).status_code==404
+    assert 'Import account JSON' in page and 'token-file' in page
+    assert 'color-scheme:dark' in client.get('/static/style.css').text
