@@ -3,15 +3,13 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8085:8085"
+      - 8085:8085
     environment:
-      SOUNDCLOUD_CLIENT_ID: ${SOUNDCLOUD_CLIENT_ID:-}
-      SOUNDCLOUD_CLIENT_SECRET: ${SOUNDCLOUD_CLIENT_SECRET:-}
-      SCM_REDIRECT_URI: ${SCM_REDIRECT_URI:-http://127.0.0.1:8085/auth/callback}
-      SCM_PUBLIC_URL: ${SCM_PUBLIC_URL:-http://127.0.0.1:8085}
+      SOUNDCLOUD_CLIENT_ID: "SOUNDCLOUD_CLIENT_ID"
+      SOUNDCLOUD_CLIENT_SECRET: "SOUNDCLOUD_CLIENT_SECRET"
+      SCM_REDIRECT_URI: "http://127.0.0.1:8085/auth/callback"
+      SCM_PUBLIC_URL: "http://127.0.0.1:8085"
       SCM_DATA_DIR: /data
     volumes:
-      - manager-data:/data
+      - ./manager-data:/data
     stop_grace_period: 30s
-volumes:
-  manager-data:
